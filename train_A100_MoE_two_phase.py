@@ -2,7 +2,7 @@
 train_A100_MoE_two_phase.py — Two-phase HDR MoE training on MobileHDR
 =====================================================================
 
-Phase 1 — Patch training  (200 epochs, 512×512 crops, batch 8)
+Phase 1 — Patch training  (50 epochs, 512×512 crops, batch 8)
     The model learns all noise statistics quickly with diverse patch combinations.
     Larger effective batch size → stable gradients → can use higher LR.
     Bottleneck Restormer sees 64×64 = 4096 tokens — enough global context.
@@ -270,11 +270,11 @@ if __name__ == "__main__":
         # full-resolution feature map.
         PATCH_SIZE     = 512
         batch_sz       = 8
-        num_patch      = 8    # 16 virtual repeats per image per epoch
+        num_patch      = 8    # 8 virtual repeats per image per epoch
         lr             = 1e-4  # higher LR safe with batch 8
         warmup_epochs  = 10    # linear ramp from 1% lr prevents early instability
         num_epochs     = 50
-        eta_min        = 1e-4
+        eta_min        = 1e-6  # cosine decays from lr=1e-4 down to 1e-6
         gamma          = 0.1   # moderate perceptual weight
         grad_clip      = 1.0
         rollback_mult  = 3.0   # tighter than Phase 2; batch 8 has low variance
