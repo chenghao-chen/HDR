@@ -6,7 +6,7 @@ Features:
     model_kwargs and num_experts are stored by train_A100_MoE_two_phase.py;
     falls back to MODEL_KWARGS below for legacy checkpoints)
   - Full-image or overlapping-patch inference (INFERENCE flag)
-  - Metrics in both RAW Bayer domain and RGB domain (after GBTF demosaicing)
+  - RGB-domain metrics (model outputs RGB directly; GT demosaiced with GBTF)
     • PSNR-linear, PSNR-µ (µ=5000), SSIM
   - Per-expert PSNR and per-pixel gate usage statistics (any number of experts)
   - Deterministic test noise (handled inside MobileHDRDataset) → results are
@@ -172,51 +172,55 @@ def save_jpg(tensor, path, quality=92):
 def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
                   device='cuda'):
     """
-    Runs the model on a single [1, 4, H, W] image using overlapping patches.
-    Handles any image size by reflection-padding to a multiple of the stride.
-    Overlapping patches are averaged (uniform window).
+    Runs the model on a single [1, 4, H, W] Bayer image using overlapping patches.
+    The model outputs sensor-resolution RGB, so each patch at (H_bayer, W_bayer)
+    produces an output at (2*H_bayer, 2*W_bayer). Accumulation is done at sensor res.
 
-    Returns: (blended [1,4,H,W],
-              expert_outs [1,K,4,H,W],
-              gates [1,K,H,W])
+    Returns: (blended [1,3,2H,2W],
+              expert_outs [1,K,3,2H,2W],
+              gates [1,K,2H,2W])
     """
-    _, C, H, W = noisy_bayer.shape
+    _, _, H, W = noisy_bayer.shape    # Bayer resolution
     stride = patch_size - overlap
 
-    # Pad to ensure full patch coverage
     pad_h = (math.ceil((H - overlap) / stride) * stride + overlap) - H
     pad_w = (math.ceil((W - overlap) / stride) * stride + overlap) - W
     x_pad = F.pad(noisy_bayer, (0, pad_w, 0, pad_h), mode='reflect')
     _, _, Hp, Wp = x_pad.shape
 
-    pred_sum   = torch.zeros_like(x_pad)
-    expert_sum = x_pad.new_zeros((1, num_experts, C, Hp, Wp))
-    gate_sum   = x_pad.new_zeros((1, num_experts, Hp, Wp))
-    weight_sum = torch.zeros((1, 1, Hp, Wp), device=device)
+    # Output arrays at sensor resolution (2× Bayer)
+    Hs, Ws = Hp * 2, Wp * 2
+    out_patch = patch_size * 2                    # output patch size in sensor pixels
+    pred_sum   = torch.zeros((1, 3, Hs, Ws), device=device)
+    expert_sum = torch.zeros((1, num_experts, 3, Hs, Ws), device=device)
+    gate_sum   = torch.zeros((1, num_experts, Hs, Ws), device=device)
+    weight_sum = torch.zeros((1, 1, Hs, Ws), device=device)
 
-    # Uniform window — plain averaging over overlaps (no dark feathered edges)
-    win = torch.ones((1, 1, patch_size, patch_size), device=device)
+    win = torch.ones((1, 1, out_patch, out_patch), device=device)
 
-    snr_full = estimate_local_snr_map(x_pad, window_size=5)  # once, full image
+    snr_full = estimate_local_snr_map(x_pad, window_size=5)
 
-    for y in range(0, Hp - patch_size + 1, stride):
-        for x in range(0, Wp - patch_size + 1, stride):
-            patch    = x_pad[:, :, y:y+patch_size, x:x+patch_size]
-            snr_crop = snr_full[:, :, y:y+patch_size, x:x+patch_size]
+    for yi in range(0, Hp - patch_size + 1, stride):
+        for xi in range(0, Wp - patch_size + 1, stride):
+            patch    = x_pad[:, :, yi:yi+patch_size, xi:xi+patch_size]
+            snr_crop = snr_full[:, :, yi:yi+patch_size, xi:xi+patch_size]
 
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 pred, experts, gates = model(patch, snr_crop)
 
-            pred_sum  [:, :,    y:y+patch_size, x:x+patch_size] += pred * win
-            expert_sum[:, :, :, y:y+patch_size, x:x+patch_size] += experts * win.unsqueeze(1)
-            gate_sum  [:, :,    y:y+patch_size, x:x+patch_size] += gates * win[:, 0]
-            weight_sum[:, :,    y:y+patch_size, x:x+patch_size] += win
+            # Output offsets at sensor resolution
+            ys, xs = yi * 2, xi * 2
+            pred_sum  [:, :,    ys:ys+out_patch, xs:xs+out_patch] += pred.float() * win
+            expert_sum[:, :, :, ys:ys+out_patch, xs:xs+out_patch] += experts.float() * win.unsqueeze(1)
+            gate_sum  [:, :,    ys:ys+out_patch, xs:xs+out_patch] += gates.float() * win[:, 0]
+            weight_sum[:, :,    ys:ys+out_patch, xs:xs+out_patch] += win
 
-    denom = weight_sum + 1e-8                      # [1, 1, Hp, Wp]
+    denom  = weight_sum + 1e-8                    # [1, 1, Hs, Ws]
+    H_out, W_out = H * 2, W * 2                  # crop to original sensor size
     return (
-        pred_sum  [...,    :H, :W] / denom[...,            :H, :W],
-        expert_sum[..., :, :H, :W] / denom.unsqueeze(1)[..., :H, :W],
-        gate_sum  [...,    :H, :W] / denom[...,            :H, :W],
+        pred_sum  [...,    :H_out, :W_out] / denom[...,            :H_out, :W_out],
+        expert_sum[..., :, :H_out, :W_out] / denom.unsqueeze(1)[..., :H_out, :W_out],
+        gate_sum  [...,    :H_out, :W_out] / denom[...,            :H_out, :W_out],
     )
 
 
@@ -224,12 +228,14 @@ def infer_full(model, noisy_bayer, device='cuda'):
     """
     Full-resolution inference — no patches, no blending artifacts.
 
-    The model's PixelUnshuffle chain requires H and W divisible by 8.
-    We reflect-pad if needed and crop back after inference.
+    Input is [1, 4, H, W] packed Bayer (H, W divisible by 8 required).
+    Output is sensor-resolution RGB: [1, 3, 2H, 2W] (after cropping padding).
+    We reflect-pad the Bayer input to a multiple of 8 if needed, run inference,
+    then crop the RGB output back to the true sensor size (2*H_orig, 2*W_orig).
 
-    Returns: (blended, expert_outs, gates)
+    Returns: (blended [1,3,2H,2W], expert_outs [1,K,3,2H,2W], gates [1,K,2H,2W])
     """
-    _, _, H, W = noisy_bayer.shape
+    _, _, H, W = noisy_bayer.shape    # Bayer dimensions
 
     pad_h = (8 - H % 8) % 8
     pad_w = (8 - W % 8) % 8
@@ -241,7 +247,11 @@ def infer_full(model, noisy_bayer, device='cuda'):
     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
         pred, experts, gates = model(x, snr_map)
 
-    return pred[..., :H, :W], experts[..., :H, :W], gates[..., :H, :W]
+    # Crop back to the unpadded sensor size (2× the original Bayer dims)
+    H_out, W_out = H * 2, W * 2
+    return (pred[..., :H_out, :W_out],
+            experts[..., :H_out, :W_out],
+            gates[..., :H_out, :W_out])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,8 +267,10 @@ def estimate_flops(model, patch_size=256, device='cuda'):
     try:
         from torchinfo import summary
 
+        # Input is packed Bayer (patch_size × patch_size); SNR map is also at Bayer res.
         dummy_x   = torch.zeros(1, 4, patch_size, patch_size, device=device)
         dummy_snr = torch.zeros(1, 1, patch_size, patch_size, device=device)
+        # Output will be RGB at (2*patch_size × 2*patch_size) sensor resolution.
 
         stats = summary(model, input_data=(dummy_x, dummy_snr),
                         verbose=0, mode='eval')
@@ -366,33 +378,26 @@ if __name__ == "__main__":
     print(f"  {len(test_dataset)} test samples found.\n")
 
     # ── Metrics accumulators ───────────────────────────────────────────────
+    # The model now outputs sensor-resolution RGB directly, so all metrics are
+    # in the RGB domain.  RAW Bayer domain metrics are no longer applicable.
     metrics = {
-        # Noisy input baseline (so we can report Δ PSNR)
-        "psnr_noisy_raw_mu":    [],
-        "psnr_noisy_rgb_mu":    [],
-        # Denoised output
-        "psnr_raw_linear":  [],
-        "psnr_raw_mu":      [],
-        "ssim_raw_linear":  [],
-        "ssim_raw_mu":      [],
-        "psnr_rgb_linear":  [],
-        "psnr_rgb_mu":      [],
-        "ssim_rgb_linear":  [],
-        "ssim_rgb_mu":      [],
-        # Routing
-        "pct_low_snr_pixels":   [],
-        "time_sec":         [],
+        "psnr_noisy_rgb_mu": [],   # noisy baseline (after GBTF demosaic)
+        "psnr_rgb_linear":   [],
+        "psnr_rgb_mu":       [],
+        "ssim_rgb_linear":   [],
+        "ssim_rgb_mu":       [],
+        "pct_low_snr_pixels":[],
+        "time_sec":          [],
     }
-    expert_psnr_acc = [[] for _ in range(K)]   # per-expert PSNR-µ
-    gate_usage_acc  = [[] for _ in range(K)]   # per-expert mean gate weight
+    expert_psnr_acc = [[] for _ in range(K)]
+    gate_usage_acc  = [[] for _ in range(K)]
 
     csv_path = os.path.join(OUTPUT_DIR, "results.csv")
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
         "sample_idx",
-        "psnr_noisy_raw_mu", "psnr_noisy_rgb_mu",
-        "psnr_raw_linear", "psnr_raw_mu", "ssim_raw_linear", "ssim_raw_mu",
+        "psnr_noisy_rgb_mu",
         "psnr_rgb_linear", "psnr_rgb_mu", "ssim_rgb_linear", "ssim_rgb_mu",
         "pct_low_snr_pixels",
         *[f"psnr_expert{k}_mu" for k in range(K)],
@@ -401,14 +406,14 @@ if __name__ == "__main__":
     ])
 
     print("=" * 80)
-    print(f"{'#':>4}  {'PSNR-raw-µ(noisy)':>18}  {'PSNR-raw-µ':>10}  "
+    print(f"{'#':>4}  {'PSNR-rgb-µ(noisy)':>18}  {'PSNR-rgb-lin':>12}  "
           f"{'PSNR-rgb-µ':>10}  {'gate usage':>18}  {'Time(s)':>8}")
     print("=" * 80)
 
     with torch.no_grad():
         for i, sample in enumerate(test_loader):
-            x  = sample["x"].to(DEVICE, non_blocking=True)   # [1, 4, H, W] noisy
-            y  = sample["y"].to(DEVICE, non_blocking=True)   # [1, 4, H, W] clean GT
+            x = sample["x"].to(DEVICE, non_blocking=True)   # [1, 4, H, W] noisy Bayer
+            y = sample["y"].to(DEVICE, non_blocking=True)   # [1, 4, H, W] clean GT Bayer
 
             # ── SNR stats (computed before inference) ──────────────────
             snr_full = estimate_local_snr_map(x, window_size=5)
@@ -428,54 +433,31 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
 
-            # ── Cast to float32 for metric computation ─────────────────
-            y_pred_c = y_pred.clamp(0, 1).float()
-            y_c      = y.clamp(0, 1).float()
-            x_c      = x.clamp(0, 1).float()
+            # ── Demosaic GT and noisy for comparison (y_pred is already RGB) ──
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                rgb_gt    = gbtf(packed_bayer_to_mosaic(y.clamp(0, 1).float())).clamp(0, 1).float()
+                rgb_noisy = gbtf(packed_bayer_to_mosaic(x.clamp(0, 1).float())).clamp(0, 1).float()
 
-            # ── RAW Bayer domain metrics (mu=METRIC_MU everywhere) ─────
-            tm_pred = hdr_tonemap(y_pred_c, METRIC_MU)
-            tm_gt   = hdr_tonemap(y_c,      METRIC_MU)
-            psnr_raw_lin      = psnr(y_pred_c, y_c)
-            psnr_raw_mu       = psnr(tm_pred, tm_gt)
-            ssim_raw_lin      = ssim(y_pred_c, y_c)
-            ssim_raw_mu       = ssim(tm_pred, tm_gt)
-            psnr_noisy_raw_mu = psnr(hdr_tonemap(x_c, METRIC_MU), tm_gt)
+            y_pred_c = y_pred.clamp(0, 1).float()   # [1, 3, 2H, 2W] RGB
+
+            # ── RGB domain metrics ─────────────────────────────────────
+            tm_pred           = hdr_tonemap(y_pred_c, METRIC_MU)
+            tm_gt             = hdr_tonemap(rgb_gt,   METRIC_MU)
+            psnr_rgb_lin      = psnr(y_pred_c, rgb_gt)
+            psnr_rgb_mu       = psnr(tm_pred, tm_gt)
+            ssim_rgb_lin      = ssim(y_pred_c, rgb_gt)
+            ssim_rgb_mu       = ssim(tm_pred, tm_gt)
+            psnr_noisy_rgb_mu = psnr(hdr_tonemap(rgb_noisy, METRIC_MU), tm_gt)
 
             # ── Per-expert PSNR-µ + gate usage ─────────────────────────
             psnr_experts = [
-                psnr(hdr_tonemap(expert_outs[:, k].clamp(0, 1).float(),
-                                 METRIC_MU), tm_gt)
+                psnr(hdr_tonemap(expert_outs[:, k].clamp(0, 1).float(), METRIC_MU), tm_gt)
                 for k in range(K)
             ]
             gate_usage = gates.float().mean(dim=(0, 2, 3)).tolist()  # [K]
 
-            # ── RGB domain metrics (demosaic then evaluate) ────────────
-            mosaic_pred  = packed_bayer_to_mosaic(y_pred_c)
-            mosaic_gt    = packed_bayer_to_mosaic(y_c)
-            mosaic_noisy = packed_bayer_to_mosaic(x_c)
-
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                rgb_pred  = gbtf(mosaic_pred).clamp(0, 1).float()
-                rgb_gt    = gbtf(mosaic_gt).clamp(0, 1).float()
-                rgb_noisy = gbtf(mosaic_noisy).clamp(0, 1).float()
-
-            psnr_rgb_lin      = psnr(rgb_pred, rgb_gt)
-            psnr_rgb_mu       = psnr(hdr_tonemap(rgb_pred,  METRIC_MU),
-                                     hdr_tonemap(rgb_gt,    METRIC_MU))
-            ssim_rgb_lin      = ssim(rgb_pred, rgb_gt)
-            ssim_rgb_mu       = ssim(hdr_tonemap(rgb_pred,  METRIC_MU),
-                                     hdr_tonemap(rgb_gt,    METRIC_MU))
-            psnr_noisy_rgb_mu = psnr(hdr_tonemap(rgb_noisy, METRIC_MU),
-                                     hdr_tonemap(rgb_gt,    METRIC_MU))
-
             # ── Accumulate ─────────────────────────────────────────────
-            metrics["psnr_noisy_raw_mu"].append(psnr_noisy_raw_mu)
             metrics["psnr_noisy_rgb_mu"].append(psnr_noisy_rgb_mu)
-            metrics["psnr_raw_linear"].append(psnr_raw_lin)
-            metrics["psnr_raw_mu"].append(psnr_raw_mu)
-            metrics["ssim_raw_linear"].append(ssim_raw_lin)
-            metrics["ssim_raw_mu"].append(ssim_raw_mu)
             metrics["psnr_rgb_linear"].append(psnr_rgb_lin)
             metrics["psnr_rgb_mu"].append(psnr_rgb_mu)
             metrics["ssim_rgb_linear"].append(ssim_rgb_lin)
@@ -488,9 +470,7 @@ if __name__ == "__main__":
 
             csv_writer.writerow([
                 i,
-                f"{psnr_noisy_raw_mu:.4f}", f"{psnr_noisy_rgb_mu:.4f}",
-                f"{psnr_raw_lin:.4f}",  f"{psnr_raw_mu:.4f}",
-                f"{ssim_raw_lin:.4f}",  f"{ssim_raw_mu:.4f}",
+                f"{psnr_noisy_rgb_mu:.4f}",
                 f"{psnr_rgb_lin:.4f}",  f"{psnr_rgb_mu:.4f}",
                 f"{ssim_rgb_lin:.4f}",  f"{ssim_rgb_mu:.4f}",
                 f"{pct_low:.1f}",
@@ -501,13 +481,13 @@ if __name__ == "__main__":
             csv_file.flush()
 
             usage_str = "/".join(f"{v:.2f}" for v in gate_usage)
-            print(f"{i+1:>4}  {psnr_noisy_raw_mu:>18.2f}  {psnr_raw_mu:>10.2f}  "
+            print(f"{i+1:>4}  {psnr_noisy_rgb_mu:>18.2f}  {psnr_rgb_lin:>12.2f}  "
                   f"{psnr_rgb_mu:>10.2f}  {usage_str:>18}  {elapsed:>8.3f}s")
 
             # ── Save RGB visuals ───────────────────────────────────────
             if i % SAVE_EVERY == 0:
                 vis_noisy = hdr_tonemap(rgb_noisy, METRIC_MU).clamp(0, 1)
-                vis_pred  = hdr_tonemap(rgb_pred,  METRIC_MU).clamp(0, 1)
+                vis_pred  = hdr_tonemap(y_pred_c,  METRIC_MU).clamp(0, 1)
                 vis_gt    = hdr_tonemap(rgb_gt,    METRIC_MU).clamp(0, 1)
 
                 # Downsample to half resolution before saving (full-res is ~32 MB per file)
@@ -539,17 +519,9 @@ if __name__ == "__main__":
         print(f"  GFLOPs / patch:         {gflops:.2f}")
     print()
     print(f"  ── Noisy Baseline ────────────────────────────────────")
-    print(f"  PSNR-{mu_label} (RAW):    {avg(metrics['psnr_noisy_raw_mu']):.4f} dB")
     print(f"  PSNR-{mu_label} (RGB):    {avg(metrics['psnr_noisy_rgb_mu']):.4f} dB")
     print()
-    print(f"  ── RAW Bayer Domain ──────────────────────────────────")
-    print(f"  PSNR-linear:            {avg(metrics['psnr_raw_linear']):.4f} dB")
-    delta_raw = avg(metrics['psnr_raw_mu']) - avg(metrics['psnr_noisy_raw_mu'])
-    print(f"  PSNR-{mu_label}:          {avg(metrics['psnr_raw_mu']):.4f} dB  (delta +{delta_raw:.2f} dB)")
-    print(f"  SSIM-linear:            {avg(metrics['ssim_raw_linear']):.4f}")
-    print(f"  SSIM-{mu_label}:          {avg(metrics['ssim_raw_mu']):.4f}")
-    print()
-    print(f"  ── RGB Domain (post GBTF demosaic) ───────────────────")
+    print(f"  ── RGB Domain (direct model output) ──────────────────")
     print(f"  PSNR-linear:            {avg(metrics['psnr_rgb_linear']):.4f} dB")
     delta_rgb = avg(metrics['psnr_rgb_mu']) - avg(metrics['psnr_noisy_rgb_mu'])
     print(f"  PSNR-{mu_label}:          {avg(metrics['psnr_rgb_mu']):.4f} dB  (delta +{delta_rgb:.2f} dB)")

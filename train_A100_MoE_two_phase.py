@@ -2,7 +2,7 @@
 train_A100_MoE_two_phase.py — Two-phase HDR MoE training on MobileHDR
 =====================================================================
 
-Phase 1 — Patch training  (200 epochs, 512×512 crops, batch 8)
+Phase 1 — Patch training  (50 epochs, 512×512 crops, batch 8)
     The model learns all noise statistics quickly with diverse patch combinations.
     Larger effective batch size → stable gradients → can use higher LR.
     Bottleneck Restormer sees 64×64 = 4096 tokens — enough global context.
@@ -67,6 +67,7 @@ import wandb
 
 from HDR_model_hybrid_Teacher import build_denoiser, estimate_local_snr_map
 from HDR_Mobile_dataset import MobileHDRDataset
+from DifferentiableGBTF_BGGR import DifferentiableGBTF_BGGR
 
 os.environ["WANDB_CACHE_DIR"] = "/scratch/gilbreth/chen4848/wandb_cache"
 os.environ["WANDB_DATA_DIR"]  = "/scratch/gilbreth/chen4848/wandb_data"
@@ -270,11 +271,11 @@ if __name__ == "__main__":
         # full-resolution feature map.
         PATCH_SIZE     = 512
         batch_sz       = 8
-        num_patch      = 8    # 16 virtual repeats per image per epoch
+        num_patch      = 8    # 8 virtual repeats per image per epoch
         lr             = 1e-4  # higher LR safe with batch 8
         warmup_epochs  = 10    # linear ramp from 1% lr prevents early instability
         num_epochs     = 50
-        eta_min        = 1e-4
+        eta_min        = 1e-6  # cosine decays from lr=1e-4 down to 1e-6
         gamma          = 0.1   # moderate perceptual weight
         grad_clip      = 1.0
         rollback_mult  = 3.0   # tighter than Phase 2; batch 8 has low variance
@@ -353,6 +354,13 @@ if __name__ == "__main__":
     loss_lpips = lpips.LPIPS(net="vgg").to(device)
     loss_lpips.eval()
     for p in loss_lpips.parameters():
+        p.requires_grad_(False)
+
+    # Fixed GBTF demosaicing — used to produce clean RGB GT from clean Bayer
+    # on GPU inside the training loop (no backprop through it).
+    gbtf = DifferentiableGBTF_BGGR().to(device)
+    gbtf.eval()
+    for p in gbtf.parameters():
         p.requires_grad_(False)
 
     # ── Logging ───────────────────────────────────────────────────────
@@ -491,48 +499,54 @@ if __name__ == "__main__":
             t1 = time.time()
 
             for i, sample in enumerate(dataloader):
-                x = sample["x"].to(device, non_blocking=True)   # noisy
-                y = sample["y"].to(device, non_blocking=True)   # clean GT
-                B, C, H, W = x.shape
+                x = sample["x"].to(device, non_blocking=True)   # noisy packed BGGR
+                y = sample["y"].to(device, non_blocking=True)   # clean packed BGGR
+                B, _, H, W = x.shape      # H, W are packed Bayer dimensions
+                Hs, Ws = H * 2, W * 2    # sensor (output) dimensions
 
-                # Build valid_mask: 1 on real pixels, 0 on reflect-padding.
-                # Phase 1 patches are never padded → mask is all ones.
-                # Phase 2 full-res images may be padded by collate_pad_to_max.
+                # Build valid_mask at sensor resolution: 1 on real pixels, 0 on padding.
+                # Phase 1 patches are uniform → mask is all ones.
+                # Phase 2 full-res images may be padded by collate_pad_to_max;
+                # orig_h / orig_w are in Bayer space, so multiply by 2 for sensor space.
                 if "orig_h" in sample:
                     orig_h = sample["orig_h"]
                     orig_w = sample["orig_w"]
-                    valid_mask = torch.zeros(B, 1, H, W, device=device)
+                    valid_mask = torch.zeros(B, 1, Hs, Ws, device=device)
                     for b in range(B):
-                        valid_mask[b, 0, :orig_h[b], :orig_w[b]] = 1.0
+                        valid_mask[b, 0, :orig_h[b] * 2, :orig_w[b] * 2] = 1.0
                 else:
-                    # Phase 1: uniform patch size, no padding
                     orig_h     = torch.full((B,), H)
                     orig_w     = torch.full((B,), W)
-                    valid_mask = torch.ones(B, 1, H, W, device=device)
+                    valid_mask = torch.ones(B, 1, Hs, Ws, device=device)
 
                 with torch.no_grad():
                     snr_map = estimate_local_snr_map(x, window_size=5)
+                    # Demosaic clean Bayer GT → clean RGB at sensor resolution.
+                    # pixel_shuffle converts (B,4,H,W) packed BGGR → (B,1,2H,2W) mosaic.
+                    y_rgb = gbtf(F.pixel_shuffle(y.float(), 2))   # [B, 3, Hs, Ws]
 
                 optimizer.zero_grad(set_to_none=True)
 
                 # ── Forward + losses ─────────────────────────────────
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
 
-                    # 1. Forward pass (unified across moe/dual/single)
-                    #    expert_outs: [B, K, C, H, W]   gates: [B, K, H, W]
+                    # 1. Forward pass (unified across moe/dual/single).
+                    #    y_pred:      [B, 3, Hs, Ws]    sensor-resolution RGB
+                    #    expert_outs: [B, K, 3, Hs, Ws] per-expert RGB
+                    #    gates:       [B, K, Hs, Ws]    routing weights at sensor res
                     y_pred, expert_outs, gates = model(x, snr_map)
+                    C = y_pred.shape[1]  # 3 RGB channels
 
-                    # 2. Main L1-µ loss on valid pixels
+                    # 2. Main L1-µ loss on valid sensor pixels
                     tm_pred  = hdr_tonemap(y_pred, mu=mu)
-                    tm_gt    = hdr_tonemap(y,      mu=mu)
+                    tm_gt    = hdr_tonemap(y_rgb,  mu=mu)
                     valid_px = valid_mask.sum()
                     loss_l1_mu = (((tm_pred - tm_gt).abs() * valid_mask).sum()
                                   / (valid_px * C + 1e-6))
 
                     # 3. Auxiliary per-expert losses: each expert's error is
-                    # weighted by its own (detached) gate, so experts
-                    # specialise on the pixels routed to them instead of all
-                    # converging to the blended solution.
+                    # weighted by its own (detached) gate so experts specialise
+                    # on the pixels routed to them.
                     if aux_weight > 0:
                         tm_experts = hdr_tonemap(expert_outs, mu=mu)
                         err = (tm_experts - tm_gt.unsqueeze(1)).abs()
@@ -544,6 +558,7 @@ if __name__ == "__main__":
 
                     # 4. Load balancing (moe only): K·Σ(mean gate)² is 1 when
                     # usage is uniform and grows toward K on collapse.
+                    # Gates are at sensor resolution; valid_mask is also at sensor res.
                     gate_usage = ((gates * valid_mask).sum(dim=(0, 2, 3))
                                   / valid_px.clamp(min=1.0))
                     if balance_weight > 0:
@@ -552,25 +567,22 @@ if __name__ == "__main__":
                         loss_balance = x.new_zeros(())
 
                 # 5. Perceptual loss on a 256×256 random crop.
-                # Always run outside autocast so LPIPS VGG stays in float32.
-                # Channel order: R=ch3, G=ch1, B=ch0  (BGGR→RGB mapping).
-                min_h  = int(orig_h.min().item())
-                min_w  = int(orig_w.min().item())
+                # Run outside autocast so LPIPS VGG stays in float32.
+                # y_pred and y_rgb are both [B, 3, Hs, Ws] RGB — crop directly.
+                min_h  = int(orig_h.min().item()) * 2   # sensor dims = 2 × Bayer dims
+                min_w  = int(orig_w.min().item()) * 2
                 crop_h = min(LPIPS_CROP, min_h)
                 crop_w = min(LPIPS_CROP, min_w)
                 top    = random.randint(0, min_h - crop_h)
                 left   = random.randint(0, min_w - crop_w)
 
                 def _lpips_crop(t):
-                    g = 0.5 * (t[:, 1, top:top+crop_h, left:left+crop_w] +
-                            t[:, 2, top:top+crop_h, left:left+crop_w])  # average G1+G2
-                    rgb = torch.stack([t[:, 3, top:top+crop_h, left:left+crop_w],  # R
-                                    g,                                             # G
-                                    t[:, 0, top:top+crop_h, left:left+crop_w]], dim=1).float()
-                    return hdr_tonemap(rgb.clamp(0, 1), mu=mu) * 2.0 - 1.0
+                    # t is [B, 3, Hs, Ws] RGB (R=ch0, G=ch1, B=ch2)
+                    crop = t[:, :, top:top+crop_h, left:left+crop_w].float()
+                    return hdr_tonemap(crop.clamp(0, 1), mu=mu) * 2.0 - 1.0
 
                 loss_perceptual = loss_lpips(_lpips_crop(y_pred),
-                                             _lpips_crop(y)).mean()
+                                             _lpips_crop(y_rgb)).mean()
 
                 # 6. Total weighted loss
                 ttl_loss = (loss_l1_mu
@@ -592,10 +604,10 @@ if __name__ == "__main__":
                 usage_sum += gate_usage.detach().float()
                 with torch.no_grad():
                     y_pred_c = y_pred.detach().float().clamp(0, 1)
-                    running_psnr    += batch_psnr_gpu(y_pred_c, y)
+                    running_psnr    += batch_psnr_gpu(y_pred_c, y_rgb)
                     running_psnr_mu += batch_psnr_gpu(
-                        hdr_tonemap(y_pred_c,  mu=mu),
-                        hdr_tonemap(y.float(), mu=mu))
+                        hdr_tonemap(y_pred_c, mu=mu),
+                        hdr_tonemap(y_rgb,    mu=mu))
 
                 print_running_loss(running_loss, running_psnr_mu, i)
 
