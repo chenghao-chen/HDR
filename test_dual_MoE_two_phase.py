@@ -83,8 +83,7 @@ def load_model_from_checkpoint(checkpoint_path, fallback_kwargs, device,
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     mode         = ckpt.get("mode", "dual")
     model_kwargs = ckpt.get("model_kwargs", fallback_kwargs)
-    # num_experts  = ckpt.get("num_experts", fallback_num_experts)
-    num_experts  = 2 #ckpt.get("num_experts", fallback_num_experts)
+    num_experts  = ckpt.get("num_experts", fallback_num_experts)
     print(f"  Checkpoint mode: '{mode}'  num_experts={num_experts}")
     print(f"  Model kwargs:    {model_kwargs}")
 
