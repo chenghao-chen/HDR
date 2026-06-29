@@ -301,7 +301,7 @@ if __name__ == "__main__":
     # Update this to the phase{1,2}_best.pth from your latest training run.
     # Naming: models_p{PHASE}_{mode}_Teacher_MobileHDR_{timestamp}/phase{PHASE}_best.pth
     # CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260605_0848/phase1_best.pth"
-    CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260619_0059/phase1_best.pth"
+    CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260620_2219/phase1_best.pth"
     OUTPUT_DIR     = f"test_results/{CHECKPOINT.split('/')[0]}"
     INFERENCE      = "full"          # "full" | "patches"
     PATCH_SIZE     = 1024

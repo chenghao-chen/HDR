@@ -27,4 +27,4 @@ set +a
 export WANDB_MODE=online
 
 # 5. Direct Execution via the Absolute Path to your Environment Binary
-/home/chen4848/.conda/envs/2025.06-py313/dl/bin/python train_A100_MoE_two_phase.py
+/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/bin/python train_A100_MoE_two_phase.py

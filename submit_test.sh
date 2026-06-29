@@ -28,4 +28,4 @@ export WANDB_MODE=online
 export WANDB_CACHE_DIR="/scratch/gilbreth/chen4848/wandb_cache"
 export WANDB_DATA_DIR="/scratch/gilbreth/chen4848/wandb_data"
 # 5. Direct Execution via the Absolute Path to your Environment Binary
-/home/chen4848/.conda/envs/2025.06-py313/dl/bin/python test_dual_MoE_two_phase.py
+/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/bin/python test_dual_MoE_two_phase.py
