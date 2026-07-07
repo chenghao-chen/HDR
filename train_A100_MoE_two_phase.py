@@ -273,9 +273,9 @@ if __name__ == "__main__":
         batch_sz       = 8
         num_patch      = 8    # 8 virtual repeats per image per epoch
         lr             = 1e-4  # higher LR safe with batch 8
-        warmup_epochs  = 10    # linear ramp from 1% lr prevents early instability
+        warmup_epochs  = 3     # short ramp; smoke test needs active LR quickly
         num_epochs     = 50
-        eta_min        = 1e-6  # cosine decays from lr=1e-4 down to 1e-6
+        eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active through epoch 50
         gamma          = 0.1   # moderate perceptual weight
         grad_clip      = 1.0
         rollback_mult  = 3.0   # tighter than Phase 2; batch 8 has low variance
