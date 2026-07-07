@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/scratch/gilbreth/chen4848/projects/HDR/test.py", line 330, in <module>
+    model, mode_tag = load_model_from_checkpoint(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/gilbreth/chen4848/projects/HDR/test.py", line 96, in load_model_from_checkpoint
+    model.load_state_dict(state, strict=True)
+  File "/home/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torch/nn/modules/module.py", line 2581, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for MoEDenoiser:
+	size mismatch for experts.0.proj_out.weight: copying a param with shape torch.Size([4, 16, 1, 1]) from checkpoint, the shape in current model is torch.Size([12, 16, 1, 1]).
+	size mismatch for experts.0.proj_out.bias: copying a param with shape torch.Size([4]) from checkpoint, the shape in current model is torch.Size([12]).
+	size mismatch for experts.1.proj_out.weight: copying a param with shape torch.Size([4, 16, 1, 1]) from checkpoint, the shape in current model is torch.Size([12, 16, 1, 1]).
+	size mismatch for experts.1.proj_out.bias: copying a param with shape torch.Size([4]) from checkpoint, the shape in current model is torch.Size([12]).

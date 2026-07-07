@@ -1,0 +1,9 @@
+
+Preparing model  [phase=1  mode=moe]
+  mode=moe  experts=2  params=20.66M
+Setting up [LPIPS] perceptual loss: trunk [vgg], v[0.1], spatial [off]
+Loading model from: /home/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/lpips/weights/v0.1/vgg.pth
+Warm-start from pretrained weights: models_p1_moe_Teacher_MobileHDR_20260620_2219/phase1_best.pth
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mrun_p1_20260620_2332_moe[0m at: [34mhttps://wandb.ai/ryanhana-wandb/hdr-dual-moe/runs/li8dh26f[0m
+[1;34mwandb[0m: Find logs at: [1;35m../HDR-denoise/wandb/run-20260620_233216-li8dh26f/logs[0m

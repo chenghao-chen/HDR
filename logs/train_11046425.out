@@ -1,0 +1,3 @@
+Logging to: test_results/models_p1_dual_Teacher_MobileHDR_20260605_0848/log.txt
+
+Loading checkpoint: models_p1_dual_Teacher_MobileHDR_20260605_0848/phase1_best.pth

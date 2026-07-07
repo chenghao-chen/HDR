@@ -1,0 +1,23 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: ryanhana (ryanhana-wandb) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.27.0
+wandb: Run data is saved locally in /scratch/gilbreth/chen4848/projects/HDR-denoise/wandb/run-20260620_233216-li8dh26f
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run run_p1_20260620_2332_moe
+wandb: ⭐️ View project at https://wandb.ai/ryanhana-wandb/hdr-dual-moe
+wandb: 🚀 View run at https://wandb.ai/ryanhana-wandb/hdr-dual-moe/runs/li8dh26f
+/home/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+Traceback (most recent call last):
+  File "/scratch/gilbreth/chen4848/projects/HDR/train_A100_MoE_two_phase.py", line 455, in <module>
+    missing, unexpected = model.load_state_dict(state, strict=False)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torch/nn/modules/module.py", line 2581, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for MoEDenoiser:
+	size mismatch for experts.0.proj_out.weight: copying a param with shape torch.Size([4, 16, 1, 1]) from checkpoint, the shape in current model is torch.Size([12, 16, 1, 1]).
+	size mismatch for experts.0.proj_out.bias: copying a param with shape torch.Size([4]) from checkpoint, the shape in current model is torch.Size([12]).
+	size mismatch for experts.1.proj_out.weight: copying a param with shape torch.Size([4, 16, 1, 1]) from checkpoint, the shape in current model is torch.Size([12, 16, 1, 1]).
+	size mismatch for experts.1.proj_out.bias: copying a param with shape torch.Size([4]) from checkpoint, the shape in current model is torch.Size([12]).

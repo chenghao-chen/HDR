@@ -1,0 +1,5 @@
+Logging to: test_results/models_p1_moe_Teacher_MobileHDR_20260605_0848/log.txt
+
+Loading checkpoint: models_p1_moe_Teacher_MobileHDR_20260605_0848/phase1_best.pth
+  Checkpoint mode: 'moe'  num_experts=3
+  Model kwargs:    {'dim': 32, 'num_blocks': [4, 4, 4, 4], 'num_refinement_blocks': 4, 'heads': [1, 2, 4, 8], 'se_reduction': 8}

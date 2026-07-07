@@ -1,0 +1,5 @@
+epoch: 50
+phase: 1
+mode: moe
+loss: 0.04314971472555344
+best_psnr_mu: 35.51826795525507

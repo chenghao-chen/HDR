@@ -1,0 +1,4 @@
+  File "/scratch/gilbreth/chen4848/projects/HDR/train_A100_MoE_two_phase.py", line 257
+    PRETRAIN_CHECKPOINT = None"models_p1_moe_Teacher_MobileHDR_20260620_2219/phase1_best.pth"   # e.g. "/path/to/pretrained.pth"
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+SyntaxError: invalid syntax

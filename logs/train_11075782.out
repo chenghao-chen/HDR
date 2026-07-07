@@ -1,0 +1,3 @@
+Logging to: test_results/models_p1_moe_Teacher_MobileHDR_20260619_0059/log.txt
+
+Loading checkpoint: models_p1_moe_Teacher_MobileHDR_20260619_0059/phase1_best.pth
