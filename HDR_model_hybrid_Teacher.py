@@ -1,44 +1,36 @@
 """
-HDR_model_hybrid_Teacher.py — Joint denoising + demosaicing for BGGR packed Bayer
-===================================================================================
+HDR_model_hybrid_Teacher.py — HDR Bayer denoiser for packed BGGR sensor data
+==============================================================================
 
 Input / Output
 ──────────────
-  Input  (B, 4, H, W)   packed BGGR Bayer in [0, 1], channel order B, G1, G2, R.
+  Input  (B, 4, H, W)   noisy packed BGGR Bayer in [0, 1].
+                         Channel order: B=0, G1=1, G2=2, R=3.
                          H, W are the PACKED dimensions (= sensor_H/2, sensor_W/2)
                          and must each be divisible by 8 (three PixelUnshuffle(2)
                          stages in the encoder).
 
-  Output (B, 3, 2H, 2W) clean RGB at full sensor resolution.
-                         The final PixelShuffle(2) stage performs the 2× spatial
-                         upsampling (demosaicing) inside the network, so no
-                         external GBTF step is needed for the model output.
+  Output (B, 4, H, W)   denoised packed BGGR Bayer in [_CLAMP_EPS, 1].
+                         Same spatial resolution as the input — no demosaicing.
+                         Apply GBTF at test time to obtain RGB for viewing.
+
+GT is clean packed Bayer, so the loss is computed directly in Bayer space with
+no intermediate demosaicing step. GBTF is only invoked in the test script for
+visualisation and RGB-domain evaluation metrics.
 
 Contents
 ────────
-  TransUNet_Teacher_HDR   Heavy CNN-Transformer U-Net (single joint-DD network).
-                          `se_reduction` adds Squeeze-Excitation to residual
-                          blocks (None = legacy architecture; old checkpoints
-                          still load).
+  TransUNet_Teacher_HDR   Heavy CNN-Transformer U-Net (single denoiser).
+  MoEDenoiser             Mixture-of-Experts: shared CNN-Transformer trunk
+                          + K lightweight ExpertHead decoders + NoiseGate router.
+  DualSNRDenoiser         Legacy 2-expert variant (kept for old checkpoints).
+  SingleDenoiser          Ablation baseline (one teacher, uniform gate).
 
-  MoEDenoiser             Semi-lightweight Mixture-of-Experts:
-                            * ONE shared trunk (encoder → Restormer latent →
-                              decoder) — ~95% of compute.
-                            * K lightweight expert heads, each producing a
-                              full-sensor-resolution RGB image.
-                            * A tiny per-pixel gate CNN conditioned on the
-                              noisy BGGR input + local SNR map routes softmax
-                              weights over the K experts.
-
-  DualSNRDenoiser         Legacy 2-expert variant: two full teachers blended
-                          by the SNR map (kept for old checkpoints).
-  SingleDenoiser          Ablation baseline (one teacher).
-
-  All three wrappers share one forward signature:
+  All three share one forward signature:
       blended, expert_outs, gates = model(x, snr_map)
-        blended:     [B, 3, 2H, 2W]    final RGB output at sensor resolution
-        expert_outs: [B, K, 3, 2H, 2W] per-expert RGB outputs
-        gates:       [B, K, 2H, 2W]    per-pixel routing weights (sum to 1)
+        blended:     [B, out_ch, H, W]    denoised Bayer at packed resolution
+        expert_outs: [B, K, out_ch, H, W] per-expert denoised Bayer
+        gates:       [B, K, H, W]         per-pixel routing weights (sum to 1)
 
   build_denoiser(mode, ...)  factory: mode in {"moe", "dual", "single"}.
 """
@@ -152,12 +144,12 @@ class HeavyExposhare(nn.Module):
 # ---------------------------------------------------------
 
 class TransUNet_Teacher_HDR(nn.Module):
-    def __init__(self, out_channels=3, dim=32, num_blocks=(4, 4, 4, 6),
+    def __init__(self, out_channels=4, dim=32, num_blocks=(4, 4, 4, 6),
                  num_refinement_blocks=4, heads=(1, 2, 4, 8), se_reduction=None):
         """
         dim=32, num_blocks=[4,4,4,6], heads=[1,2,4,8] -> ~19.5M parameters.
-        Input:  (B, 4, H, W) packed BGGR in [0, 1], H and W divisible by 8.
-        Output: (B, out_channels=3, 2H, 2W) clean RGB at sensor resolution.
+        Input:  (B, 4, H, W) noisy packed BGGR in [0, 1], H and W divisible by 8.
+        Output: (B, out_channels, H, W) denoised packed Bayer at the same resolution.
 
         se_reduction: None = legacy blocks (old checkpoints load unchanged);
                       int  = enable Squeeze-Excitation in residual blocks.
@@ -214,11 +206,8 @@ class TransUNet_Teacher_HDR(nn.Module):
         self.act_final = nn.GELU()
         self.refinement_conv2 = nn.Conv2d(dim // 2, dim // 2, kernel_size=3, padding=1)
 
-        # Upsample to full sensor resolution (2H, 2W) and project to RGB:
-        # Conv2d maps dim//2 -> out_channels*4, then PixelShuffle(2) gives
-        # out_channels channels at 2H, 2W (demosaicing upsampling).
-        self.to_rgb = nn.Conv2d(dim // 2, out_channels * 4, kernel_size=1)
-        self.upshuffle_rgb = nn.PixelShuffle(2)
+        # Project to packed Bayer output at H, W (no upsampling — same resolution as input)
+        self.to_bayer = nn.Conv2d(dim // 2, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x, return_maps=False):
         # --- Encoder ---
@@ -254,9 +243,8 @@ class TransUNet_Teacher_HDR(nn.Module):
         w_level0 = self.act_final(self.refinement_conv1(w_level0))
         w_level0 = self.refinement_conv2(w_level0)    # (B, dim//2, H, W)
 
-        # --- Upsample to sensor resolution + project to RGB ---
-        # to_rgb: dim//2 -> out_channels*4, upshuffle_rgb: ×2 spatial -> (B, 3, 2H, 2W)
-        output = self.upshuffle_rgb(self.to_rgb(w_level0))
+        # --- Project to denoised packed Bayer at H, W ---
+        output = self.to_bayer(w_level0)              # (B, out_channels, H, W)
         output = output.clamp(min=_CLAMP_EPS)
         if not self.training:
             output = output.clamp(max=1.0)
@@ -271,7 +259,7 @@ class TransUNet_Teacher_HDR(nn.Module):
                 "w_level0_refined": w_level0,
             }
 
-        return output   # (B, 3, 2H, 2W)  — sensor-resolution RGB
+        return output   # (B, out_channels, H, W) — denoised packed Bayer
 
 
 # ---------------------------------------------------------
@@ -282,11 +270,8 @@ class NoiseGate(nn.Module):
     """
     Tiny per-pixel router. Sees the noisy BGGR input (4 channels, absolute
     intensity — shot noise scales with signal) and the local SNR map (1 channel,
-    relative noisiness) and outputs softmax weights over the K experts at the
-    input (packed Bayer) spatial resolution.
-
-    The gate output is upsampled 2× in MoEDenoiser.forward before being applied
-    to the expert outputs which are at full sensor resolution.
+    relative noisiness) and outputs softmax weights over the K experts at packed
+    Bayer resolution. The output spatial resolution matches the model I/O.
 
     in_channels is always 5: 4 BGGR Bayer channels + 1 SNR channel.
     The final conv is zero-initialised so training starts from uniform routing.
@@ -305,21 +290,21 @@ class NoiseGate(nn.Module):
 
     def forward(self, x, snr_map):
         logits = self.net(torch.cat([x, snr_map], dim=1))
-        return torch.softmax(logits, dim=1)   # [B, K, H, W]  at Bayer resolution
+        return torch.softmax(logits, dim=1)   # [B, K, H, W]
 
 
 class ExpertHead(nn.Module):
     """
-    Lightweight per-expert decoder head (~150K params at dim=32).
+    Lightweight per-expert decoder head (~100K params at dim=32).
 
     Takes trunk features at half packed-Bayer resolution (H/2, W/2), applies
-    residual blocks, then two PixelShuffle(2) stages:
-      1st: H/2 -> H  (back to packed Bayer resolution)
-      2nd: H   -> 2H (sensor resolution — the demosaicing upsampling)
+    residual blocks, then one PixelShuffle(2) to reach packed Bayer resolution
+    (H, W). A final 1×1 conv projects to out_channels (4 for BGGR Bayer).
+
     The final 1×1 conv is zero-initialised so each expert starts as a
     near-zero prediction and the blended output starts near zero.
     """
-    def __init__(self, in_dim, out_channels=3, num_blocks=2, se_reduction=8):
+    def __init__(self, in_dim, out_channels=4, num_blocks=2, se_reduction=8):
         super().__init__()
         self.blocks = nn.Sequential(*[
             ResidualConvBlock(in_dim, se_reduction) for _ in range(num_blocks)
@@ -329,50 +314,49 @@ class ExpertHead(nn.Module):
         self.refine1 = nn.Conv2d(r, r, kernel_size=3, padding=1)
         self.act = nn.GELU()
         self.refine2 = nn.Conv2d(r, r, kernel_size=3, padding=1)
-        # Maps r channels -> out_channels*4 for the second PixelShuffle(2)
-        self.proj_out = nn.Conv2d(r, out_channels * 4, kernel_size=1)
-        self.up2 = nn.PixelShuffle(2)                 # -> (out_channels, 2H, 2W)
+        # Project r channels -> out_channels packed Bayer at H, W
+        self.proj_out = nn.Conv2d(r, out_channels, kernel_size=1)
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
 
     def forward(self, feat):
         z = self.blocks(feat)
-        z = self.up(z)                                # (B, r, H, W)  — packed Bayer res
+        z = self.up(z)                                # (B, r, H, W) — packed Bayer res
         z = self.act(self.refine1(z))
         z = self.refine2(z)
-        return self.up2(self.proj_out(z))             # (B, out_channels, 2H, 2W)  — sensor res
+        return self.proj_out(z)                       # (B, out_channels, H, W)
 
 
 class MoEDenoiser(nn.Module):
     """
-    Semi-lightweight Mixture-of-Experts HDR joint denoising + demosaicing model.
+    Mixture-of-Experts HDR Bayer denoiser.
 
-    One shared trunk (encoder -> Restormer latent -> decoder) feeds K lightweight
-    expert heads. Each head outputs a full-sensor-resolution RGB prediction.
-    A per-pixel gate conditioned on the noisy BGGR input + SNR map (both at
-    packed Bayer resolution) produces softmax weights, which are bilinearly
-    upsampled 2× to sensor resolution before blending the expert RGB outputs.
+    One shared trunk (encoder → Restormer latent → decoder) feeds K lightweight
+    expert heads. Each head outputs a denoised packed Bayer prediction at the
+    same H×W resolution as the input. A per-pixel gate conditioned on the noisy
+    BGGR input + SNR map (both at packed Bayer resolution) produces softmax
+    weights, which directly blend the expert Bayer outputs at packed Bayer
+    resolution (no upsampling needed — gate and outputs share the same H×W).
 
-    At the default size (dim=32, num_blocks=[4,4,4,4], K=3) this is ~21M
-    parameters and ~1.05x the FLOPs of a single teacher.
+    At the default size (dim=32, num_blocks=[4,4,4,4], K=2) this is ~20M params.
 
     forward(x, snr_map) -> (blended, expert_outs, gates)
         x:        [B, 4, H, W]  packed BGGR in [0, 1], H, W % 8 == 0
         snr_map:  [B, 1, H, W]  normalised local SNR in [0, 1]
     Returns:
-        blended:     [B, 3, 2H, 2W]    sensor-resolution RGB
-        expert_outs: [B, K, 3, 2H, 2W] per-expert RGB
-        gates:       [B, K, 2H, 2W]    routing weights at sensor resolution
+        blended:     [B, out_ch, H, W]    denoised Bayer at packed Bayer resolution
+        expert_outs: [B, K, out_ch, H, W] per-expert denoised Bayer
+        gates:       [B, K, H, W]         routing weights at packed Bayer resolution
     """
-    def __init__(self, out_channels=3, dim=32, num_blocks=(4, 4, 4, 4),
+    def __init__(self, out_channels=4, dim=32, num_blocks=(4, 4, 4, 4),
                  num_refinement_blocks=4, heads=(1, 2, 4, 8), se_reduction=8,
-                 num_experts=3, expert_blocks=2, gate_hidden=16):
+                 num_experts=2, expert_blocks=2, gate_hidden=16):
         super().__init__()
         del num_refinement_blocks   # lives inside the expert heads
         self.dim = dim
         self.num_experts = num_experts
 
-        # ======== Shared trunk (same topology as the teacher through decoder_level_1) ========
+        # ======== Shared trunk ========
         self.bayer_unshuffle = nn.PixelUnshuffle(2)
         self.patch_embed = nn.Conv2d(16, dim, kernel_size=3, stride=1, padding=1)
 
@@ -411,8 +395,7 @@ class MoEDenoiser(nn.Module):
             ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction)
             for _ in range(num_experts)
         ])
-        # Gate always sees 4 BGGR channels + 1 SNR channel = 5 inputs,
-        # regardless of the RGB output channel count.
+        # Gate sees 4 BGGR channels + 1 SNR channel = 5 inputs
         self.gate = NoiseGate(num_experts, in_channels=5, hidden=gate_hidden)
 
     def _trunk(self, x):
@@ -434,17 +417,15 @@ class MoEDenoiser(nn.Module):
     def forward(self, x, snr_map):
         feat = self._trunk(x)                          # [B, dim*2, H/2, W/2]
 
-        # Each expert head outputs sensor-resolution RGB: [B, 3, 2H, 2W]
+        # Each expert head outputs denoised packed Bayer: [B, out_ch, H, W]
         expert_outs = torch.stack(
             [head(feat).clamp(min=_CLAMP_EPS) for head in self.experts],
-            dim=1)                                     # [B, K, 3, 2H, 2W]
+            dim=1)                                     # [B, K, out_ch, H, W]
 
-        # Gate at packed Bayer resolution, then bilinearly upsample to sensor res
-        gates_lr = self.gate(x, snr_map)              # [B, K, H, W]
-        gates = F.interpolate(gates_lr, scale_factor=2.0,
-                              mode='bilinear', align_corners=False)  # [B, K, 2H, 2W]
+        # Gate and expert outputs are at the same packed Bayer resolution — no upsampling
+        gates = self.gate(x, snr_map)                 # [B, K, H, W]
 
-        blended = (gates.unsqueeze(2) * expert_outs).sum(dim=1)    # [B, 3, 2H, 2W]
+        blended = (gates.unsqueeze(2) * expert_outs).sum(dim=1)  # [B, out_ch, H, W]
 
         if not self.training:
             blended     = blended.clamp(max=1.0)
@@ -460,12 +441,11 @@ class MoEDenoiser(nn.Module):
 class DualSNRDenoiser(nn.Module):
     """
     Two independent full teachers blended by the pixel-wise SNR map.
-    The SNR map is at packed Bayer resolution; it is bilinearly upsampled to
-    sensor resolution before blending the RGB teacher outputs:
-        out = (1 - snr_up) * out_low + snr_up * out_high
+    Both teachers output denoised packed Bayer at H×W. The SNR map is also at
+    H×W (packed Bayer resolution), so blending requires no interpolation:
+        out = (1 - snr) * out_low + snr * out_high
     Heavy (2x teacher params and FLOPs) — kept for existing checkpoints.
-    Returns the unified (blended, expert_outs, gates) tuple where gates are at
-    sensor resolution to match expert_outs.
+    Returns the unified (blended, expert_outs, gates) tuple.
     """
     def __init__(self, **kwargs):
         super().__init__()
@@ -474,14 +454,12 @@ class DualSNRDenoiser(nn.Module):
         self.denoiser_high_snr = TransUNet_Teacher_HDR(**kwargs)
 
     def forward(self, x, snr_map):
-        out_low  = self.denoiser_low_snr(x)            # [B, 3, 2H, 2W]
-        out_high = self.denoiser_high_snr(x)           # [B, 3, 2H, 2W]
-        # Upsample SNR map from Bayer res to sensor res for blending
-        snr_up = F.interpolate(snr_map, size=out_low.shape[-2:],
-                               mode='bilinear', align_corners=False)  # [B, 1, 2H, 2W]
-        blended = (1.0 - snr_up) * out_low + snr_up * out_high
-        expert_outs = torch.stack([out_low, out_high], dim=1)         # [B, 2, 3, 2H, 2W]
-        gates = torch.cat([1.0 - snr_up, snr_up], dim=1)             # [B, 2, 2H, 2W]
+        out_low  = self.denoiser_low_snr(x)            # [B, out_ch, H, W]
+        out_high = self.denoiser_high_snr(x)           # [B, out_ch, H, W]
+        # SNR map is already at packed Bayer resolution — blend directly
+        blended = (1.0 - snr_map) * out_low + snr_map * out_high
+        expert_outs = torch.stack([out_low, out_high], dim=1)  # [B, 2, out_ch, H, W]
+        gates = torch.cat([1.0 - snr_map, snr_map], dim=1)    # [B, 2, H, W]
         return blended, expert_outs, gates
 
 
@@ -496,21 +474,21 @@ class SingleDenoiser(nn.Module):
         self.denoiser = TransUNet_Teacher_HDR(**kwargs)
 
     def forward(self, x, snr_map):
-        out = self.denoiser(x)                         # [B, 3, 2H, 2W]
-        # Gate is uniform 1.0 at sensor resolution
-        gates = F.interpolate(torch.ones_like(snr_map), size=out.shape[-2:],
-                              mode='nearest')          # [B, 1, 2H, 2W]
+        out = self.denoiser(x)                         # [B, out_ch, H, W]
+        gates = torch.ones_like(snr_map)               # [B, 1, H, W] — uniform weight
         return out, out.unsqueeze(1), gates
 
 
-def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16, **kwargs):
+def build_denoiser(mode, num_experts=2, expert_blocks=2, gate_hidden=16, **kwargs):
     """
     Factory shared by the train and test scripts.
     mode: "moe" (shared trunk + K light experts)  |  "dual"  |  "single"
     kwargs are forwarded to the underlying model(s):
         out_channels, dim, num_blocks, num_refinement_blocks, heads,
         se_reduction (None for legacy pre-SE checkpoints).
+    Default out_channels=4 (packed BGGR Bayer).
     """
+    kwargs.setdefault("out_channels", 4)
     mode = mode.lower()
     if mode == "moe":
         return MoEDenoiser(num_experts=num_experts, expert_blocks=expert_blocks,

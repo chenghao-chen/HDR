@@ -1,6 +1,11 @@
 """
-train_A100_MoE_two_phase.py — Two-phase HDR MoE training on MobileHDR
-=====================================================================
+train_A100_MoE_two_phase.py — Two-phase HDR MoE Bayer denoiser training
+========================================================================
+
+Task: Bayer denoising.
+  Input:  (B, 4, H, W) noisy packed BGGR Bayer in [0, 1]
+  Output: (B, 4, H, W) denoised packed BGGR Bayer in [0, 1]
+  GT:     clean packed BGGR Bayer — direct, exact supervision, no GBTF.
 
 Phase 1 — Patch training  (50 epochs, 512×512 crops, batch 8)
     The model learns all noise statistics quickly with diverse patch combinations.
@@ -14,27 +19,27 @@ Phase 2 — Full-res fine-tune  (30 epochs, full frames, batch 1)
     statistics (boundary effects, global exposure, structured noise).
     Very small LR — adapt, don't relearn.
 
+Loss
+────
+  L = L1-µ(blended, y_bayer)
+    + γ · LPIPS(pseudo_RGB(blended), pseudo_RGB(y_bayer))
+    + aux · Σ_k gate_k-weighted L1-µ(expert_k, y_bayer)
+    + bal · load-balance                               (MoE only)
+
+  LPIPS uses pseudo-RGB from packed Bayer:
+    R = ch[3],  G = 0.5*(ch[1]+ch[2]),  B = ch[0]
+  This is computed at Bayer resolution — no GBTF needed during training.
+  GBTF is applied at test time only (test_dual_MoE_two_phase.py).
+
 Model modes (MODE flag)
 ───────────────────────
   "moe"    MoEDenoiser — ONE shared trunk + K lightweight expert heads with
            a learned per-pixel gate conditioned on (noisy input, SNR map).
-           Experts specialise on different noise levels. ~half the params
-           and FLOPs of "dual" while supporting K ≥ 2 experts.
   "dual"   Legacy DualSNRDenoiser — two full teachers blended by the SNR map.
   "single" One teacher, no routing (ablation).
 
 All modes share one forward signature:
     blended, expert_outs, gates = model(x, snr_map)
-and one loss:
-    L = L1-µ(blended) + γ·LPIPS + aux·Σ_k gate_k-weighted L1-µ(expert_k)
-        + bal·load-balance                       (balance: moe only)
-
-Usage
-─────
-  Phase 1:  set PHASE = 1, then submit job.
-  Phase 2:  set PHASE = 2  AND  set PHASE1_CHECKPOINT to the best .pth from
-            the Phase 1 run.  Phase 2 auto-loads it if no Phase 2 checkpoint
-            exists in the current save folder.
 
 D4 augmentation for BGGR packed Bayer
 ──────────────────────────────────────
@@ -49,8 +54,7 @@ the BGGR channel-spatial correspondence:
 
 Applying H-flip, V-flip, and Transpose independently at 50% each gives all 8
 D4 symmetries with equal probability (Phase 1 — square patches only).
-Full-res images are non-square so Transpose is skipped (Phase 2); H-flip and
-V-flip independently already cover the 4 dimension-preserving symmetries.
+Full-res images are non-square so Transpose is skipped (Phase 2).
 """
 
 import os
@@ -67,7 +71,6 @@ import wandb
 
 from HDR_model_hybrid_Teacher import build_denoiser, estimate_local_snr_map
 from HDR_Mobile_dataset import MobileHDRDataset
-from DifferentiableGBTF_BGGR import DifferentiableGBTF_BGGR
 
 os.environ["WANDB_CACHE_DIR"] = "/scratch/gilbreth/chen4848/wandb_cache"
 os.environ["WANDB_DATA_DIR"]  = "/scratch/gilbreth/chen4848/wandb_data"
@@ -124,6 +127,15 @@ def batch_psnr_gpu(img, gt, data_range=1.0):
         return p.mean().item()
 
 
+def bayer_to_pseudo_rgb(t):
+    """
+    Packed BGGR [B, 4, H, W] -> pseudo-RGB [B, 3, H, W] at Bayer resolution.
+    R = ch[3], G = avg(ch[1], ch[2]), B = ch[0].
+    Used for LPIPS (VGG needs 3-channel input) without requiring GBTF.
+    """
+    return torch.stack([t[:, 3], 0.5 * (t[:, 1] + t[:, 2]), t[:, 0]], dim=1)
+
+
 def collate_xy(batch):
     """
     Phase 1 collate: stacks only the tensors the loop uses. The dataset
@@ -140,8 +152,8 @@ def collate_pad_to_max(batch):
     """
     Pads variable-size full-resolution images to the largest H×W in the
     batch (rounded up to a multiple of 8) so PyTorch can stack them.
-    Stores original sizes in orig_h / orig_w so padded pixels can be
-    excluded from the loss via a binary valid_mask.
+    Stores original sizes in orig_h / orig_w (in packed Bayer dimensions)
+    so padded pixels can be excluded from the loss via valid_mask.
     Used only in Phase 2 (full-resolution) where images differ in size.
     """
     max_h = ((max(s["x"].shape[1] for s in batch) + 7) // 8) * 8
@@ -154,8 +166,8 @@ def collate_pad_to_max(batch):
     return {
         "x":      torch.stack([pad(s["x"]) for s in batch]),
         "y":      torch.stack([pad(s["y"]) for s in batch]),
-        "orig_h": torch.tensor([s["x"].shape[1] for s in batch]),
-        "orig_w": torch.tensor([s["x"].shape[2] for s in batch]),
+        "orig_h": torch.tensor([s["x"].shape[1] for s in batch]),  # Bayer H
+        "orig_w": torch.tensor([s["x"].shape[2] for s in batch]),  # Bayer W
     }
 
 
@@ -253,7 +265,6 @@ if __name__ == "__main__":
     timestamp_str    = datetime.now().strftime("%Y%m%d_%H%M")
     mode_tag         = MODE
     save_folder      = (f"models_p{PHASE}_{mode_tag}_Teacher_"f"MobileHDR_{timestamp_str}/")
-    # save_folder      = "models_p1_moe_Teacher_MobileHDR_20260605_0848/"
     dataset_dir      = "/scratch/gilbreth/chen4848/datasets/Mobile-HDR"
     create_folder(save_folder)
 
@@ -264,28 +275,26 @@ if __name__ == "__main__":
 
     # ── Phase-specific hyperparameters ────────────────────────────────
     if PHASE == 1:
-        # ── Patch training ────────────────────────────────────────────
+        # ── Patch training (smoke-test schedule) ─────────────────────
         # 512×512 packed patches (= 1024×1024 sensor crop).
         # Bottleneck Restormer sees 64×64 = 4096 tokens — sufficient for
-        # global noise statistics without processing the entire 49K-token
-        # full-resolution feature map.
+        # global noise statistics without processing the entire sensor.
+        # LR schedule: short 3-epoch warmup → cosine to 3e-5, keeping
+        # active learning through all 50 epochs (eta_min is ~1/3 of peak).
         PATCH_SIZE     = 512
         batch_sz       = 8
         num_patch      = 8    # 8 virtual repeats per image per epoch
-        lr             = 1e-4  # higher LR safe with batch 8
-        warmup_epochs  = 3     # short ramp; smoke test needs active LR quickly
+        lr             = 1e-4
+        warmup_epochs  = 3     # short ramp; get to peak LR by epoch 3
         num_epochs     = 50
-        eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active through epoch 50
-        gamma          = 0.1   # moderate perceptual weight
+        eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active all 50 epochs
+        gamma          = 0.1   # perceptual weight
         grad_clip      = 1.0
         rollback_mult  = 3.0   # tighter than Phase 2; batch 8 has low variance
-        LPIPS_CROP     = 256   # sub-crop from 512×512 patch for LPIPS
+        LPIPS_CROP     = 256   # Bayer-resolution crop fed to LPIPS (pseudo-RGB)
 
     else:
         # ── Full-resolution fine-tune ─────────────────────────────────
-        # batch_sz=1 is the limit for full frames on A100-80 GB.
-        # Very small LR: the model is already trained — just adapt the
-        # boundary/global-context statistics to full-resolution inputs.
         PATCH_SIZE     = None  # full resolution
         batch_sz       = 1
         num_patch      = 1
@@ -299,20 +308,22 @@ if __name__ == "__main__":
         LPIPS_CROP     = 256
 
     # Shared loss weights
-    mu             = 5000   # µ-law tonemapping constant (HDR literature standard)
+    mu             = 5000   # µ-law tonemapping constant (Kalantari SIGGRAPH 2017)
     aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
-    balance_weight = 0.01 if MODE == "moe" else 0.0   # anti expert-collapse
+    balance_weight = 0.01 if MODE == "moe" else 0.0
 
     start_epoch = 0
     best_psnr_mu = 0.0
     last_epoch_psnr_mu, last_epoch_loss = 0.0, 1e6
 
+    # out_channels=4: model outputs packed BGGR Bayer (same as input format)
     model_kwargs = {
-        "dim":                  32,
-        "num_blocks":           [4, 4, 4, 4],
+        "out_channels":          4,
+        "dim":                   32,
+        "num_blocks":            [4, 4, 4, 4],
         "num_refinement_blocks": 4,
-        "heads":                [1, 2, 4, 8],
-        "se_reduction":         8,
+        "heads":                 [1, 2, 4, 8],
+        "se_reduction":          8,
     }
 
     # ── W&B ───────────────────────────────────────────────────────────
@@ -354,13 +365,6 @@ if __name__ == "__main__":
     loss_lpips = lpips.LPIPS(net="vgg").to(device)
     loss_lpips.eval()
     for p in loss_lpips.parameters():
-        p.requires_grad_(False)
-
-    # Fixed GBTF demosaicing — used to produce clean RGB GT from clean Bayer
-    # on GPU inside the training loop (no backprop through it).
-    gbtf = DifferentiableGBTF_BGGR().to(device)
-    gbtf.eval()
-    for p in gbtf.parameters():
         p.requires_grad_(False)
 
     # ── Logging ───────────────────────────────────────────────────────
@@ -412,17 +416,13 @@ if __name__ == "__main__":
               f"  best_psnr_mu={best_psnr_mu:.2f}")
 
     if os.path.exists(save_path):
-        # Resume this phase's own interrupted run
         print(f"Resuming Phase {PHASE} from {save_path}")
         _load_checkpoint(save_path)
 
     elif PHASE == 2 and os.path.exists(PHASE1_CHECKPOINT):
-        # Start Phase 2 from the best Phase 1 weights.
-        # Do NOT load the Phase 1 scheduler state — Phase 2 uses a
-        # different schedule and the state would be meaningless.
         print(f"Phase 2 init: loading Phase 1 weights from {PHASE1_CHECKPOINT}")
         _load_checkpoint(PHASE1_CHECKPOINT, load_scheduler=False)
-        start_epoch  = 0     # Phase 2 epoch counter resets
+        start_epoch     = 0
         last_epoch_loss = 1e6
         best_psnr_mu    = 0.0
 
@@ -435,7 +435,6 @@ if __name__ == "__main__":
     else:
         print("Starting Phase 1 from scratch.")
 
-    # Compile AFTER any checkpoint load so weights map onto the raw module.
     if USE_COMPILE and hasattr(torch, "compile"):
         model = torch.compile(model)
         print("  Model compiled with TorchInductor.")
@@ -446,13 +445,10 @@ if __name__ == "__main__":
     print("Creating dataset...")
 
     if PHASE == 1:
-        # Square patches: full 8-way D4. Crop happens inside the dataset
-        # (before noise synthesis) — the transform only flips/transposes.
         transform  = make_d4_transform(allow_transpose=True)
         crop_size  = PATCH_SIZE
-        collate_fn = collate_xy    # uniform patch size, skip duplicate 'xm'
+        collate_fn = collate_xy
     else:
-        # Non-square full frames: 4 dimension-preserving symmetries only.
         transform  = make_d4_transform(allow_transpose=False)
         crop_size  = None
         collate_fn = collate_pad_to_max
@@ -480,15 +476,11 @@ if __name__ == "__main__":
     print(f"  {len(dataset)} virtual samples  →  {n_batches} batches/epoch")
 
     # ── Training loop ─────────────────────────────────────────────────
-    # NOTE: autocast uses bfloat16 (same exponent range as fp32), so no
-    # GradScaler is needed — plain backward + clip + step.
     print(f"\nPhase {PHASE} training started  ({num_epochs} epochs)\n")
     training_t0 = time.time()
 
     for epoch in range(start_epoch, num_epochs):
 
-        # ── Inner loop with rollback ───────────────────────────────────
-        # Re-runs the epoch if a loss spike is detected (e.g. outlier image).
         improved = False
         while not improved:
             running_loss    = 0.0
@@ -500,55 +492,48 @@ if __name__ == "__main__":
 
             for i, sample in enumerate(dataloader):
                 x = sample["x"].to(device, non_blocking=True)   # noisy packed BGGR
-                y = sample["y"].to(device, non_blocking=True)   # clean packed BGGR
-                B, _, H, W = x.shape      # H, W are packed Bayer dimensions
-                Hs, Ws = H * 2, W * 2    # sensor (output) dimensions
+                y = sample["y"].to(device, non_blocking=True)   # clean packed BGGR GT
+                B, C_in, H, W = x.shape      # H, W are packed Bayer dimensions
 
-                # Build valid_mask at sensor resolution: 1 on real pixels, 0 on padding.
-                # Phase 1 patches are uniform → mask is all ones.
-                # Phase 2 full-res images may be padded by collate_pad_to_max;
-                # orig_h / orig_w are in Bayer space, so multiply by 2 for sensor space.
+                # valid_mask at packed Bayer resolution: 1 on real pixels, 0 on padding.
+                # Phase 1 patches are uniform → all-ones mask.
+                # Phase 2 full-res images may be padded; orig_h/orig_w are in Bayer dims.
                 if "orig_h" in sample:
                     orig_h = sample["orig_h"]
                     orig_w = sample["orig_w"]
-                    valid_mask = torch.zeros(B, 1, Hs, Ws, device=device)
+                    valid_mask = torch.zeros(B, 1, H, W, device=device)
                     for b in range(B):
-                        valid_mask[b, 0, :orig_h[b] * 2, :orig_w[b] * 2] = 1.0
+                        valid_mask[b, 0, :orig_h[b], :orig_w[b]] = 1.0
                 else:
                     orig_h     = torch.full((B,), H)
                     orig_w     = torch.full((B,), W)
-                    valid_mask = torch.ones(B, 1, Hs, Ws, device=device)
+                    valid_mask = torch.ones(B, 1, H, W, device=device)
 
                 with torch.no_grad():
                     snr_map = estimate_local_snr_map(x, window_size=5)
-                    # Demosaic clean Bayer GT → clean RGB at sensor resolution.
-                    # pixel_shuffle converts (B,4,H,W) packed BGGR → (B,1,2H,2W) mosaic.
-                    y_rgb = gbtf(F.pixel_shuffle(y.float(), 2))   # [B, 3, Hs, Ws]
 
                 optimizer.zero_grad(set_to_none=True)
 
                 # ── Forward + losses ─────────────────────────────────
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
 
-                    # 1. Forward pass (unified across moe/dual/single).
-                    #    y_pred:      [B, 3, Hs, Ws]    sensor-resolution RGB
-                    #    expert_outs: [B, K, 3, Hs, Ws] per-expert RGB
-                    #    gates:       [B, K, Hs, Ws]    routing weights at sensor res
+                    # 1. Forward pass
+                    #    y_pred:      [B, 4, H, W]    denoised packed BGGR
+                    #    expert_outs: [B, K, 4, H, W] per-expert denoised Bayer
+                    #    gates:       [B, K, H, W]    routing weights
                     y_pred, expert_outs, gates = model(x, snr_map)
-                    C = y_pred.shape[1]  # 3 RGB channels
+                    C = y_pred.shape[1]   # 4 Bayer channels
 
-                    # 2. Main L1-µ loss on valid sensor pixels
-                    tm_pred  = hdr_tonemap(y_pred, mu=mu)
-                    tm_gt    = hdr_tonemap(y_rgb,  mu=mu)
+                    # 2. Main L1-µ loss: denoised Bayer vs clean Bayer GT
+                    tm_pred  = hdr_tonemap(y_pred,    mu=mu)
+                    tm_gt    = hdr_tonemap(y.float(), mu=mu)
                     valid_px = valid_mask.sum()
                     loss_l1_mu = (((tm_pred - tm_gt).abs() * valid_mask).sum()
                                   / (valid_px * C + 1e-6))
 
-                    # 3. Auxiliary per-expert losses: each expert's error is
-                    # weighted by its own (detached) gate so experts specialise
-                    # on the pixels routed to them.
+                    # 3. Auxiliary per-expert losses
                     if aux_weight > 0:
-                        tm_experts = hdr_tonemap(expert_outs, mu=mu)
+                        tm_experts = hdr_tonemap(expert_outs, mu=mu)  # [B, K, 4, H, W]
                         err = (tm_experts - tm_gt.unsqueeze(1)).abs()
                         w   = gates.detach().unsqueeze(2) * valid_mask.unsqueeze(1)
                         loss_aux = ((w * err).sum(dim=(0, 2, 3, 4))
@@ -556,9 +541,7 @@ if __name__ == "__main__":
                     else:
                         loss_aux = x.new_zeros(())
 
-                    # 4. Load balancing (moe only): K·Σ(mean gate)² is 1 when
-                    # usage is uniform and grows toward K on collapse.
-                    # Gates are at sensor resolution; valid_mask is also at sensor res.
+                    # 4. Load balancing (MoE only)
                     gate_usage = ((gates * valid_mask).sum(dim=(0, 2, 3))
                                   / valid_px.clamp(min=1.0))
                     if balance_weight > 0:
@@ -566,23 +549,25 @@ if __name__ == "__main__":
                     else:
                         loss_balance = x.new_zeros(())
 
-                # 5. Perceptual loss on a 256×256 random crop.
-                # Run outside autocast so LPIPS VGG stays in float32.
-                # y_pred and y_rgb are both [B, 3, Hs, Ws] RGB — crop directly.
-                min_h  = int(orig_h.min().item()) * 2   # sensor dims = 2 × Bayer dims
-                min_w  = int(orig_w.min().item()) * 2
+                # 5. Perceptual loss on a pseudo-RGB crop at Bayer resolution.
+                # Pseudo-RGB: (R=ch3, G=avg(ch1,ch2), B=ch0) — no GBTF needed.
+                # Run outside autocast so VGG stays in float32.
+                min_h  = int(orig_h.min().item())
+                min_w  = int(orig_w.min().item())
                 crop_h = min(LPIPS_CROP, min_h)
                 crop_w = min(LPIPS_CROP, min_w)
                 top    = random.randint(0, min_h - crop_h)
                 left   = random.randint(0, min_w - crop_w)
 
                 def _lpips_crop(t):
-                    # t is [B, 3, Hs, Ws] RGB (R=ch0, G=ch1, B=ch2)
-                    crop = t[:, :, top:top+crop_h, left:left+crop_w].float()
-                    return hdr_tonemap(crop.clamp(0, 1), mu=mu) * 2.0 - 1.0
+                    # t: [B, 4, H, W] packed BGGR
+                    c = t[:, :, top:top+crop_h, left:left+crop_w].float()
+                    pseudo = torch.stack(
+                        [c[:, 3], 0.5 * (c[:, 1] + c[:, 2]), c[:, 0]], dim=1)
+                    return hdr_tonemap(pseudo.clamp(0, 1), mu=mu) * 2.0 - 1.0
 
                 loss_perceptual = loss_lpips(_lpips_crop(y_pred),
-                                             _lpips_crop(y_rgb)).mean()
+                                             _lpips_crop(y)).mean()
 
                 # 6. Total weighted loss
                 ttl_loss = (loss_l1_mu
@@ -590,7 +575,6 @@ if __name__ == "__main__":
                             + aux_weight     * loss_aux
                             + balance_weight * loss_balance)
 
-                # ── Backward (bf16 autocast → no GradScaler needed) ──
                 ttl_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
@@ -604,10 +588,11 @@ if __name__ == "__main__":
                 usage_sum += gate_usage.detach().float()
                 with torch.no_grad():
                     y_pred_c = y_pred.detach().float().clamp(0, 1)
-                    running_psnr    += batch_psnr_gpu(y_pred_c, y_rgb)
+                    y_gt_c   = y.float()
+                    running_psnr    += batch_psnr_gpu(y_pred_c, y_gt_c)
                     running_psnr_mu += batch_psnr_gpu(
                         hdr_tonemap(y_pred_c, mu=mu),
-                        hdr_tonemap(y_rgb,    mu=mu))
+                        hdr_tonemap(y_gt_c,   mu=mu))
 
                 print_running_loss(running_loss, running_psnr_mu, i)
 
@@ -639,9 +624,6 @@ if __name__ == "__main__":
             wandb.log(log_dict)
 
             # ── Rollback check ────────────────────────────────────────
-            # If the loss spikes by more than rollback_mult × last epoch's
-            # loss, reload the previous checkpoint and retry the epoch.
-            # This guards against outlier images or transient instability.
             improved = True
             if (last_epoch_psnr_mu > 10.0
                     and epoch_loss > rollback_mult * last_epoch_loss):
@@ -660,14 +642,11 @@ if __name__ == "__main__":
                 last_epoch_psnr_mu = epoch_psnr_mu
                 last_epoch_loss = epoch_loss
 
-        # ── LR schedule step (accepted epochs only) ───────────────────
-        # Advancing the scheduler on a rolled-back epoch would decay LR
-        # even though the model weights were reverted.
         scheduler.step()
 
         # ── Save checkpoints ──────────────────────────────────────────
-        # model_kwargs / mode / num_experts are stored so the test script
-        # can rebuild the exact architecture without manual sync.
+        # model_kwargs / mode / num_experts stored so test script can
+        # rebuild the exact architecture from the checkpoint alone.
         save_dict = {
             "epoch":                epoch + 1,
             "phase":                PHASE,
@@ -692,7 +671,7 @@ if __name__ == "__main__":
     # ── Done ──────────────────────────────────────────────────────────
     total = time.time() - training_t0
     msg   = (f"\nPhase {PHASE} finished in {total/3600:.2f} h  |  "
-             f"best PSNR-µ = {best_psnr_mu:.2f} dB")
+             f"best PSNR-µ = {best_psnr_mu:.2f} dB  (Bayer domain)")
     write_log(logfile, msg)
     print(msg)
 
