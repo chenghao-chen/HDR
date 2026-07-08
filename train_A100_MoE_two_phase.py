@@ -286,7 +286,7 @@ if __name__ == "__main__":
         num_patch      = 8    # 8 virtual repeats per image per epoch
         lr             = 1e-4
         warmup_epochs  = 3     # short ramp; get to peak LR by epoch 3
-        num_epochs     = 50
+        num_epochs     = 200
         eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active all 50 epochs
         gamma          = 0.1   # perceptual weight
         grad_clip      = 1.0
