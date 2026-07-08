@@ -10,7 +10,7 @@ Input / Output
                          and must each be divisible by 8 (three PixelUnshuffle(2)
                          stages in the encoder).
 
-  Output (B, 4, H, W)   denoised packed BGGR Bayer in [_CLAMP_EPS, 1].
+  Output (B, 4, H, W)   denoised packed BGGR Bayer in [0, 1].
                          Same spatial resolution as the input — no demosaicing.
                          Apply GBTF at test time to obtain RGB for viewing.
 
@@ -208,6 +208,9 @@ class TransUNet_Teacher_HDR(nn.Module):
 
         # Project to packed Bayer output at H, W (no upsampling — same resolution as input)
         self.to_bayer = nn.Conv2d(dim // 2, out_channels, kernel_size=3, padding=1)
+        # Zero-init so the residual correction starts at 0 and output = noisy input.
+        nn.init.zeros_(self.to_bayer.weight)
+        nn.init.zeros_(self.to_bayer.bias)
 
     def forward(self, x, return_maps=False):
         # --- Encoder ---
@@ -243,11 +246,11 @@ class TransUNet_Teacher_HDR(nn.Module):
         w_level0 = self.act_final(self.refinement_conv1(w_level0))
         w_level0 = self.refinement_conv2(w_level0)    # (B, dim//2, H, W)
 
-        # --- Project to denoised packed Bayer at H, W ---
-        output = self.to_bayer(w_level0)              # (B, out_channels, H, W)
-        output = output.clamp(min=_CLAMP_EPS)
+        # --- Residual: predict correction over noisy input ---
+        output = self.to_bayer(w_level0) + x          # (B, out_channels, H, W)
+        output = output.clamp(0, 1)
         if not self.training:
-            output = output.clamp(max=1.0)
+            output = output.clamp(0, 1)
 
         if return_maps:
             return output, {
@@ -274,7 +277,6 @@ class NoiseGate(nn.Module):
     Bayer resolution. The output spatial resolution matches the model I/O.
 
     in_channels is always 5: 4 BGGR Bayer channels + 1 SNR channel.
-    The final conv is zero-initialised so training starts from uniform routing.
     """
     def __init__(self, num_experts, in_channels=5, hidden=16):
         super().__init__()
@@ -285,9 +287,6 @@ class NoiseGate(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden, num_experts, kernel_size=1),
         )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
     def forward(self, x, snr_map):
         logits = self.net(torch.cat([x, snr_map], dim=1))
         return torch.softmax(logits, dim=1)   # [B, K, H, W]
@@ -302,7 +301,8 @@ class ExpertHead(nn.Module):
     (H, W). A final 1×1 conv projects to out_channels (4 for BGGR Bayer).
 
     The final 1×1 conv is zero-initialised so each expert starts as a
-    near-zero prediction and the blended output starts near zero.
+    zero correction; the caller adds the noisy input (residual learning),
+    so the blended output starts at the noisy input and learns from there.
     """
     def __init__(self, in_dim, out_channels=4, num_blocks=2, se_reduction=8):
         super().__init__()
@@ -417,9 +417,10 @@ class MoEDenoiser(nn.Module):
     def forward(self, x, snr_map):
         feat = self._trunk(x)                          # [B, dim*2, H/2, W/2]
 
-        # Each expert head outputs denoised packed Bayer: [B, out_ch, H, W]
+        # Expert heads output residual corrections; add noisy input for residual learning.
+        # At init (proj_out zero-init): correction = 0 → expert_out = x (noisy pass-through).
         expert_outs = torch.stack(
-            [head(feat).clamp(min=_CLAMP_EPS) for head in self.experts],
+            [(head(feat) + x).clamp(0, 1) for head in self.experts],
             dim=1)                                     # [B, K, out_ch, H, W]
 
         # Gate and expert outputs are at the same packed Bayer resolution — no upsampling
@@ -428,8 +429,8 @@ class MoEDenoiser(nn.Module):
         blended = (gates.unsqueeze(2) * expert_outs).sum(dim=1)  # [B, out_ch, H, W]
 
         if not self.training:
-            blended     = blended.clamp(max=1.0)
-            expert_outs = expert_outs.clamp(max=1.0)
+            blended     = blended.clamp(0, 1)
+            expert_outs = expert_outs.clamp(0, 1)
 
         return blended, expert_outs, gates
 
