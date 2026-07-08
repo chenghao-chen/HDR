@@ -248,7 +248,7 @@ if __name__ == "__main__":
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  TOP-LEVEL FLAGS  — the only lines you change between runs
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    PHASE       = 1        # 1 = patch training  |  2 = full-res fine-tune
+    PHASE       = 2        # 1 = patch training  |  2 = full-res fine-tune
     MODE        = "moe"    # "moe" | "dual" | "single"
     NUM_EXPERTS = 2        # MoE only: experts across noise levels
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     # Required for Phase 2: path to the best Phase 1 checkpoint.
     # Phase 2 loads this if no Phase 2 checkpoint exists yet.
     PHASE1_CHECKPOINT = (
-        "models_p1_moe_Teacher_MobileHDR_YYYYMMDD_HHMM/phase1_best.pth"
+        "models_p1_moe_Teacher_MobileHDR_20260707_2033/phase1_best.pth"
     )
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
