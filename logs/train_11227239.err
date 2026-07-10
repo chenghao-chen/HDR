@@ -1,0 +1,46 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: ryanhana (ryanhana-wandb) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run q8es5h6g
+wandb: Tracking run with wandb version 0.27.0
+wandb: Run data is saved locally in /scratch/gilbreth/chen4848/projects/HDR-denoise/wandb/run-20260708_051442-q8es5h6g
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run run_p2_20260708_0514_moe
+wandb: ⭐️ View project at https://wandb.ai/ryanhana-wandb/hdr-dual-moe
+wandb: 🚀 View run at https://wandb.ai/ryanhana-wandb/hdr-dual-moe/runs/q8es5h6g
+/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+wandb: uploading artifact hdr_p2_moe_final
+wandb: uploading summary
+wandb: 
+wandb: Run history:
+wandb:              epoch ▁▁▁▂▂▂▂▃▃▃▃▄▄▄▄▅▅▅▅▆▆▆▆▇▇▇▇███
+wandb:              phase ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: train/gate_usage_0 ▆▅▇▆█▆▄▄▅▃▅▄▄▄▅▅▁▂▅▂▄▁▃▃▅▅▁▄▂▃
+wandb: train/gate_usage_1 ▃▄▂▃▁▃▅▅▄▆▄▅▅▅▄▄█▇▄▇▅█▆▆▄▄█▅▇▆
+wandb:         train/loss ▇▄▄▄▅▄▆▄▃▃▃▅▅▁▃▅▅▇▅▆▃▆▆▆▅▄▇▅██
+wandb:     train/loss_aux █▅▄▃▄▃▅▄▃▁▃▄▄▁▂▄▃▅▃▃▂▃▄▃▄▃▅▄▅▅
+wandb: train/loss_balance ▆▅▆▅█▇▄▅▆▅▆▄▅▆▆▅▂▃▄▂▅▁▃▃▆▄▂▄▂▃
+wandb:   train/loss_l1_mu ▁▂▄▅▄▆▆▅▄▆▅▅▅▅▆▆▆▇▇█▅█▇▆▅▆█▆██
+wandb:  train/loss_percep ▄▃▂▄▅▄▅▂▁▄▃▄▄▁▃▄▅▆▅▆▅▇▅▆▄▄▇▆▇█
+wandb:           train/lr ██████▇▇▇▇▆▆▆▅▅▄▄▄▃▃▃▂▂▂▂▁▁▁▁▁
+wandb:                 +2 ...
+wandb: 
+wandb: Run summary:
+wandb:              epoch 30
+wandb:              phase 2
+wandb: train/gate_usage_0 0.85873
+wandb: train/gate_usage_1 0.14127
+wandb:         train/loss 0.19318
+wandb:     train/loss_aux 0.20652
+wandb: train/loss_balance 0.57684
+wandb:   train/loss_l1_mu 0.0544
+wandb:  train/loss_percep 0.59506
+wandb:           train/lr 0.0
+wandb:                 +2 ...
+wandb: 
+wandb: 🚀 View run run_p2_20260708_0514_moe at: https://wandb.ai/ryanhana-wandb/hdr-dual-moe/runs/q8es5h6g
+wandb: ⭐️ View project at: https://wandb.ai/ryanhana-wandb/hdr-dual-moe
+wandb: Synced 5 W&B file(s), 0 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: .-denoise/wandb/run-20260708_051442-q8es5h6g/logs
