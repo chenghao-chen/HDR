@@ -248,7 +248,7 @@ if __name__ == "__main__":
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  TOP-LEVEL FLAGS  — the only lines you change between runs
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    PHASE       = 2        # 1 = patch training  |  2 = full-res fine-tune
+    PHASE       = 1        # 1 = patch training  |  2 = full-res fine-tune
     MODE        = "moe"    # "moe" | "dual" | "single"
     NUM_EXPERTS = 2        # MoE only: experts across noise levels
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     # Required for Phase 2: path to the best Phase 1 checkpoint.
     # Phase 2 loads this if no Phase 2 checkpoint exists yet.
     PHASE1_CHECKPOINT = (
-        "models_p1_moe_Teacher_MobileHDR_20260707_2033/phase1_best.pth"
+        "models_p1_moe_Teacher_MobileHDR_YYYYMMDD_HHMM/phase1_best.pth"
     )
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -310,7 +310,8 @@ if __name__ == "__main__":
     # Shared loss weights
     mu             = 5000   # µ-law tonemapping constant (Kalantari SIGGRAPH 2017)
     aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
-    balance_weight = 0.01 if MODE == "moe" else 0.0
+    balance_weight = 0.05 if MODE == "moe" else 0.0
+    tv_weight      = 0.1  if MODE == "moe" else 0.0
 
     start_epoch = 0
     best_psnr_mu = 0.0
@@ -345,6 +346,7 @@ if __name__ == "__main__":
             "gamma":            gamma,
             "aux_weight":       aux_weight,
             "balance_weight":   balance_weight,
+            "tv_weight":        tv_weight,
             "grad_clip":        grad_clip,
             "rollback_mult":    rollback_mult,
             "lpips_crop":       LPIPS_CROP,
@@ -381,7 +383,7 @@ if __name__ == "__main__":
         f"LR         : {lr}  warmup={warmup_epochs}ep  "
         f"cosine→{eta_min}  total={num_epochs}ep\n"
         f"mu (tonemap): {mu}\n"
-        f"Loss weights: gamma={gamma}  aux={aux_weight}  balance={balance_weight}\n"
+        f"Loss weights: gamma={gamma}  aux={aux_weight}  balance={balance_weight}  gate_tv={tv_weight}\n"
         f"Grad clip  : {grad_clip}   rollback×{rollback_mult}\n"
         f"Model      : {model_kwargs}  params={n_params:.2f}M\n"
         f"{'='*60}\n\n"
@@ -486,7 +488,7 @@ if __name__ == "__main__":
             running_loss    = 0.0
             running_psnr    = 0.0
             running_psnr_mu = 0.0
-            comp_sums = {"l1_mu": 0.0, "percep": 0.0, "aux": 0.0, "balance": 0.0}
+            comp_sums = {"l1_mu": 0.0, "percep": 0.0, "aux": 0.0, "balance": 0.0, "gate_tv": 0.0}
             usage_sum = torch.zeros(K, device=device)
             t1 = time.time()
 
@@ -549,6 +551,15 @@ if __name__ == "__main__":
                     else:
                         loss_balance = x.new_zeros(())
 
+                    # 5. Gate spatial smoothness — TV on gate map [B, K, H, W]
+                    if tv_weight > 0 and gates is not None:
+                        loss_gate_tv = (
+                            (gates[:, :, 1:, :] - gates[:, :, :-1, :]).abs().mean()
+                            + (gates[:, :, :, 1:] - gates[:, :, :, :-1]).abs().mean()
+                        )
+                    else:
+                        loss_gate_tv = x.new_zeros(())
+
                 # 5. Perceptual loss on a pseudo-RGB crop at Bayer resolution.
                 # Pseudo-RGB: (R=ch3, G=avg(ch1,ch2), B=ch0) — no GBTF needed.
                 # Run outside autocast so VGG stays in float32.
@@ -573,7 +584,8 @@ if __name__ == "__main__":
                 ttl_loss = (loss_l1_mu
                             + gamma          * loss_perceptual
                             + aux_weight     * loss_aux
-                            + balance_weight * loss_balance)
+                            + balance_weight * loss_balance
+                            + tv_weight      * loss_gate_tv)
 
                 ttl_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -585,6 +597,7 @@ if __name__ == "__main__":
                 comp_sums["percep"]  += loss_perceptual.item()
                 comp_sums["aux"]     += loss_aux.item()
                 comp_sums["balance"] += loss_balance.item()
+                comp_sums["gate_tv"] += loss_gate_tv.item()
                 usage_sum += gate_usage.detach().float()
                 with torch.no_grad():
                     y_pred_c = y_pred.detach().float().clamp(0, 1)
@@ -618,6 +631,7 @@ if __name__ == "__main__":
                 "train/loss_percep":   comp_sums["percep"]  / n_batches,
                 "train/loss_aux":      comp_sums["aux"]     / n_batches,
                 "train/loss_balance":  comp_sums["balance"] / n_batches,
+                "train/loss_gate_tv":  comp_sums["gate_tv"] / n_batches,
             }
             for k_idx, usage_k in enumerate(epoch_usage):
                 log_dict[f"train/gate_usage_{k_idx}"] = usage_k

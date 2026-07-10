@@ -5,19 +5,18 @@ HDR_Mobile_dataset.py — MobileHDR packed-Bayer dataset with synthetic noise
 Tensors on disk: (4, H, W) float32 packed BGGR Bayer (channels B, G1, G2, R),
 unnormalised HDR values (see convert_npz_to_pt.py).
 
-Noise model (high noise — matches the proven recipe in HDR_dataset.py)
+Noise model
 ──────────────────────────────────────────────────────────────────────
 Poisson-Gaussian in digital numbers (DN), signal in [0, pix_max]:
 
     var[DN²] = shot_gain * signal[DN] + read_var,
-    shot_gain = 14, read_var ~ U(135, 160)
+    shot_gain = 4, read_var ~ U(20, 45)
 
-At 10 bit this gives σ ≈ 120 DN (12% of full scale) in highlights and
-σ ≈ 12 DN in the blacks; on top of that the triangular low-light alpha
-(biased toward 0.1) scales the signal down, so dark scenes get severe
-relative noise. NOTE: the previous version normalised the signal to [0, 1]
-before multiplying by shot_gain, which silently capped the noise variance
-at ~14 DN² (~100x too weak).
+At 10 bit this gives σ ≈ 64 DN (6% of full scale) in highlights and
+σ ≈ 5 DN in the blacks; the triangular low-light alpha (min 0.1) scales
+the signal down so dark scenes get elevated relative noise. NOTE: the
+previous version used shot_gain=14 and read_var~U(135,160) which was
+~3-4x noisier than a typical mobile sensor.
 
 Efficiency
 ──────────
@@ -51,8 +50,8 @@ def _rand(generator=None) -> float:
 
 def add_photon_noise(image: torch.Tensor, nbits: int = 10,
                      random_alpha: bool = True, do_expand: bool = False,
-                     shot_gain: float = 14.0,               # ← increased
-                     read_noise_range=(135.0, 160.0),       # ← increased
+                     shot_gain: float = 4.0,
+                     read_noise_range=(20.0, 45.0),
                      norm_min=None, norm_max=None,
                      generator: torch.Generator = None) -> tuple:
     pix_max = float(2 ** nbits - 1)
@@ -65,7 +64,7 @@ def add_photon_noise(image: torch.Tensor, nbits: int = 10,
     if random_alpha:
         # Peaks at 0 (true extreme low-light), range [0, 1]
         alpha = abs(_rand(generator) - _rand(generator))
-        alpha = max(alpha, 0.01)   # avoid pure black
+        alpha = max(alpha, 0.1)    # avoid extremely dark scenes
     else:
         alpha = 1.0
 
@@ -95,8 +94,8 @@ class MobileHDRDataset(Dataset):
     def __init__(self, base_dir: str, split: str = "train", transform=None,
                  nbits: int = 10, random_alpha: bool = True,
                  num_patch: int = 16, crop_size: int = None,
-                 do_expand: bool = False, shot_gain: float = 14.0,
-                 read_noise_range=(135.0, 160.0), test_noise_seed: int = 2025):
+                 do_expand: bool = False, shot_gain: float = 4.0,
+                 read_noise_range=(20.0, 45.0), test_noise_seed: int = 2025):
         """
         crop_size: if set (train only), a random crop_size² crop is taken
             BEFORE noise synthesis and `transform` only needs to handle
