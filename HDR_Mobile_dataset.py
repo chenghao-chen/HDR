@@ -10,13 +10,12 @@ Noise model
 Poisson-Gaussian in digital numbers (DN), signal in [0, pix_max]:
 
     var[DN²] = shot_gain * signal[DN] + read_var,
-    shot_gain = 4, read_var ~ U(20, 45)
+    shot_gain = 6, read_var ~ U(40, 70)
 
-At 10 bit this gives σ ≈ 64 DN (6% of full scale) in highlights and
-σ ≈ 5 DN in the blacks; the triangular low-light alpha (min 0.1) scales
-the signal down so dark scenes get elevated relative noise. NOTE: the
-previous version used shot_gain=14 and read_var~U(135,160) which was
-~3-4x noisier than a typical mobile sensor.
+At 10 bit this gives σ ≈ 79 DN (7.7% of full scale) in highlights and
+σ ≈ 8 DN in the blacks; the triangular low-light alpha (min 0.1) scales
+the signal down so dark scenes get elevated relative noise. Corresponds
+roughly to ISO 1600 on a typical mobile sensor.
 
 Efficiency
 ──────────
@@ -50,8 +49,8 @@ def _rand(generator=None) -> float:
 
 def add_photon_noise(image: torch.Tensor, nbits: int = 10,
                      random_alpha: bool = True, do_expand: bool = False,
-                     shot_gain: float = 4.0,
-                     read_noise_range=(20.0, 45.0),
+                     shot_gain: float = 6.0,
+                     read_noise_range=(40.0, 70.0),
                      norm_min=None, norm_max=None,
                      generator: torch.Generator = None) -> tuple:
     pix_max = float(2 ** nbits - 1)
@@ -94,8 +93,8 @@ class MobileHDRDataset(Dataset):
     def __init__(self, base_dir: str, split: str = "train", transform=None,
                  nbits: int = 10, random_alpha: bool = True,
                  num_patch: int = 16, crop_size: int = None,
-                 do_expand: bool = False, shot_gain: float = 4.0,
-                 read_noise_range=(20.0, 45.0), test_noise_seed: int = 2025):
+                 do_expand: bool = False, shot_gain: float = 6.0,
+                 read_noise_range=(40.0, 70.0), test_noise_seed: int = 2025):
         """
         crop_size: if set (train only), a random crop_size² crop is taken
             BEFORE noise synthesis and `transform` only needs to handle
