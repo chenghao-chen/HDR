@@ -289,7 +289,7 @@ if __name__ == "__main__":
     # Update to the phase{1,2}_best.pth from your latest training run.
     CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260707_2033/phase1_best.pth"
     OUTPUT_DIR     = f"test_results/{CHECKPOINT.split('/')[0]}"
-    INFERENCE      = "full"          # "full" | "patches"
+    INFERENCE      = "patches"       # "full" | "patches"
     PATCH_SIZE     = 512             # Bayer-resolution patch size for patch inference
     PATCH_OVERLAP  = PATCH_SIZE // 4
     SAVE_EVERY     = 1
