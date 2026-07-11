@@ -249,7 +249,7 @@ if __name__ == "__main__":
     #  TOP-LEVEL FLAGS  — the only lines you change between runs
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     PHASE       = 1        # 1 = patch training  |  2 = full-res fine-tune
-    MODE        = "moe"    # "moe" | "dual" | "single"
+    MODE        = "single" # "moe" | "dual" | "single"
     NUM_EXPERTS = 2        # MoE only: experts across noise levels
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
                            # stable torch+inductor on the cluster)
@@ -286,9 +286,10 @@ if __name__ == "__main__":
         num_patch      = 8    # 8 virtual repeats per image per epoch
         lr             = 1e-4
         warmup_epochs  = 3     # short ramp; get to peak LR by epoch 3
-        num_epochs     = 50    # diagnostic: does the compressed cosine schedule
-                                # (eta_min by ~epoch 50) still reach the epoch-41
-                                # breakthrough seen in the 200-epoch K=2 run?
+        num_epochs     = 150   # recalibrated: best checkpoint in the 200-epoch
+                                # K=2 run was epoch 149; 150 keeps LR high enough
+                                # through ~epoch 40 (needed for the breakthrough)
+                                # while dropping the wasted 150-200 noise tail
         eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active all 50 epochs
         gamma          = 0.1   # perceptual weight (matches last non-collapsed run, 20260711_0142)
         grad_clip      = 1.0
