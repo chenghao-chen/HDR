@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/scratch/gilbreth/chen4848/projects/HDR/test_dual_MoE_two_phase.py", line 527, in <module>
+    save_gate_visualization(
+  File "/scratch/gilbreth/chen4848/projects/HDR/test_dual_MoE_two_phase.py", line 206, in save_gate_visualization
+    row = torch.cat([row, sep.to(p.device), p], dim=2)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0! (when checking argument for argument tensors in method wrapper_CUDA_cat)

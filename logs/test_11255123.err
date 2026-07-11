@@ -1,0 +1,17 @@
+Traceback (most recent call last):
+  File "/scratch/gilbreth/chen4848/projects/HDR/test_dual_MoE_two_phase.py", line 363, in <module>
+    model, mode_tag = load_model_from_checkpoint(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/gilbreth/chen4848/projects/HDR/test_dual_MoE_two_phase.py", line 84, in load_model_from_checkpoint
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torch/serialization.py", line 1425, in load
+    with _open_file_like(f, "rb") as opened_file:
+         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torch/serialization.py", line 751, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torch/serialization.py", line 732, in __init__
+    super().__init__(open(name, mode))
+                     ^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'models_p1_moe_Teacher_MobileHDR_2026070/phase1_best.pth'

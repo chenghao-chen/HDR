@@ -1,0 +1,18 @@
+Logging to: test_results/models_p1_moe_Teacher_MobileHDR_20260707_2033/log.txt
+
+Loading checkpoint: models_p1_moe_Teacher_MobileHDR_20260707_2033/phase1_best.pth
+  Checkpoint mode: 'moe'  num_experts=2
+  Model kwargs:    {'out_channels': 4, 'dim': 32, 'num_blocks': [4, 4, 4, 4], 'num_refinement_blocks': 4, 'heads': [1, 2, 4, 8], 'se_reduction': 8}
+  Weights loaded.
+
+Estimating model complexity...
+  Parameters:             20.66 M
+  FLOPs (one 512×512 patch): 216.19 GFLOPs
+
+Loading test dataset...
+  28 test samples found.
+
+================================================================================
+   #   PSNR-rgb-µ(noisy)  PSNR-rgb-lin  PSNR-rgb-µ          gate usage   Time(s)
+================================================================================
+   1               14.28         35.17       14.91           0.90/0.09     0.958s
