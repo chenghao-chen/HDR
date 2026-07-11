@@ -328,7 +328,7 @@ if __name__ == "__main__":
     # ── Configuration ──────────────────────────────────────────────────────
     DATASET_DIR    = "/scratch/gilbreth/chen4848/datasets/Mobile-HDR"
     # Update to the phase{1,2}_best.pth from your latest training run.
-    CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260709_2256/phase1_best.pth"
+    CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260711_0142/phase1_best.pth"
     OUTPUT_DIR     = f"test_results/{CHECKPOINT.split('/')[0]}"
     INFERENCE      = "patches"       # "full" | "patches"
     PATCH_SIZE     = 512             # Bayer-resolution patch size for patch inference
