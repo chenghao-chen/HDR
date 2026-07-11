@@ -288,7 +288,7 @@ if __name__ == "__main__":
         warmup_epochs  = 3     # short ramp; get to peak LR by epoch 3
         num_epochs     = 200
         eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active all 50 epochs
-        gamma          = 0.1   # perceptual weight
+        gamma          = 0.0   # perceptual weight (disabled: VGG domain mismatch on HDR Bayer)
         grad_clip      = 1.0
         rollback_mult  = 3.0   # tighter than Phase 2; batch 8 has low variance
         LPIPS_CROP     = 256   # Bayer-resolution crop fed to LPIPS (pseudo-RGB)
@@ -302,7 +302,7 @@ if __name__ == "__main__":
         warmup_epochs  = 0
         num_epochs     = 30
         eta_min        = 1e-7
-        gamma          = 0.05  # near-zero perceptual; focus on pixel fidelity
+        gamma          = 0.0   # perceptual weight (disabled: VGG domain mismatch on HDR Bayer)
         grad_clip      = 0.5   # tighter clip for fine-tune stability
         rollback_mult  = 5.0
         LPIPS_CROP     = 256
