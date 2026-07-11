@@ -186,9 +186,8 @@ _GATE_PALETTE = torch.tensor([
 def gate_argmax_map(gates):
     """[K, H, W] softmax gate weights -> [3, H, W] RGB, one flat color per dominant expert."""
     K = gates.shape[0]
-    idx = gates.argmax(dim=0)
-    palette = _GATE_PALETTE[:K].to(gates.device)
-    return palette[idx].permute(2, 0, 1)
+    idx = gates.argmax(dim=0).cpu()
+    return _GATE_PALETTE[:K][idx].permute(2, 0, 1)
 
 
 def save_gate_visualization(gates, path):
@@ -203,7 +202,7 @@ def save_gate_visualization(gates, path):
     sep = torch.ones(3, panels[0].shape[1], 2)
     row = panels[0]
     for p in panels[1:]:
-        row = torch.cat([row, sep.to(p.device), p], dim=2)
+        row = torch.cat([row, sep, p], dim=2)
     save_jpg(row, path)
 
 
