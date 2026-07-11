@@ -12,3 +12,36 @@ wandb: 🚀 View run at https://wandb.ai/ryanhana-wandb/hdr-dual-moe/runs/8um4xd
   warnings.warn(msg)
 /scratch/gilbreth/chen4848/.conda/envs/2025.06-py313/dl/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:243: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
   warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+wandb: uploading artifact hdr_p1_moe_final; updating run metadata
+wandb: uploading artifact hdr_p1_moe_final
+wandb: 
+wandb: Run history:
+wandb:              epoch ▁▁▁▁▁▂▂▂▂▂▂▃▃▃▃▄▄▄▄▄▄▄▅▅▅▅▅▅▅▆▆▆▆▇▇▇▇▇▇█
+wandb:              phase ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: train/gate_usage_0 ▁▂▂▂▂▂▂▂▂▂▂▂▂▂▂▇▇▇▇▇▇▇▇▇▇▇▇▇█▇▇█▇▇█▇████
+wandb: train/gate_usage_1 █▇▆▆▆▆▆▆▆▆▆▆▆▄▃▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▁▂▂▁▂▁▁▁▁▁
+wandb:         train/loss █████▄▃▃▃▃▃▃▃▃▃▃▃▃▂▃▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:     train/loss_aux ██▅▄▄▄▄▅▅▄▄▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▁▁▁▂▁▁▁▁▁▁▁▁
+wandb: train/loss_balance ▁▁▁▁▁▁▁▁▁▁▁▁▃▅▅▆▆▆▆▆▆▆▆▆▆▇▇▇▇▇▇▇▇▇██████
+wandb:   train/loss_l1_mu █▇▇▇▅▅▆▅▅▅▅▃▃▃▃▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:  train/loss_percep █▇▇▇▇▇▆▆▆▆▆▄▄▄▄▄▄▃▃▃▃▃▃▂▂▂▂▂▂▂▂▂▂▂▂▁▁▁▁▁
+wandb:           train/lr ▁▅█████▇▇▇▇▇▇▆▆▆▆▅▅▅▄▄▄▄▄▃▃▃▃▃▂▂▂▂▁▁▁▁▁▁
+wandb:                 +2 ...
+wandb: 
+wandb: Run summary:
+wandb:              epoch 150
+wandb:              phase 1
+wandb: train/gate_usage_0 0.75967
+wandb: train/gate_usage_1 0.24033
+wandb:         train/loss 0.20791
+wandb:     train/loss_aux 0.18133
+wandb: train/loss_balance 0.31431
+wandb:   train/loss_l1_mu 0.05727
+wandb:  train/loss_percep 0.56836
+wandb:           train/lr 3e-05
+wandb:                 +2 ...
+wandb: 
+wandb: 🚀 View run run_p1_20260711_1020_moe at: https://wandb.ai/ryanhana-wandb/hdr-dual-moe/runs/8um4xdv3
+wandb: ⭐️ View project at: https://wandb.ai/ryanhana-wandb/hdr-dual-moe
+wandb: Synced 5 W&B file(s), 0 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: .-denoise/wandb/run-20260711_102011-8um4xdv3/logs

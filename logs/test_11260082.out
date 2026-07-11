@@ -1,0 +1,72 @@
+Logging to: test_results/models_p1_moe_Teacher_MobileHDR_20260711_0931/log.txt
+
+Loading checkpoint: models_p1_moe_Teacher_MobileHDR_20260711_0931/phase1_best.pth
+  Checkpoint mode: 'moe'  num_experts=2
+  Model kwargs:    {'out_channels': 4, 'dim': 32, 'num_blocks': [4, 4, 4, 4], 'num_refinement_blocks': 4, 'heads': [1, 2, 4, 8], 'se_reduction': 8}
+  Weights loaded.
+
+Estimating model complexity...
+  Parameters:             20.66 M
+  FLOPs (one 512×512 patch): 216.19 GFLOPs
+
+Loading test dataset...
+  28 test samples found.
+
+================================================================================
+   #   PSNR-rgb-µ(noisy)  PSNR-rgb-lin  PSNR-rgb-µ          gate usage   Time(s)
+================================================================================
+   1               14.28         39.91       15.64           0.50/0.50     2.526s
+   2               14.84         37.63       17.00           0.50/0.50     0.235s
+   3               14.91         37.13       17.10           0.50/0.50     0.236s
+   4               14.98         37.07       16.97           0.50/0.50     0.351s
+   5               14.67         38.39       17.46           0.50/0.50     0.235s
+   6               16.26         30.93       19.19           0.50/0.50     0.354s
+   7               14.07         42.07       14.85           0.50/0.50     0.232s
+   8               13.51         41.82       14.10           0.50/0.50     0.233s
+   9               14.10         39.71       16.21           0.50/0.50     0.233s
+  10               14.59         36.81       15.62           0.50/0.50     0.235s
+  11               14.24         35.73       14.54           0.50/0.50     0.235s
+  12               14.95         34.49       15.99           0.50/0.50     0.234s
+  13               15.26         34.84       16.07           0.50/0.50     0.233s
+  14               14.23         38.84       15.78           0.50/0.50     0.232s
+  15               14.36         41.90       15.42           0.50/0.50     0.233s
+  16               13.94         40.11       14.46           0.50/0.50     0.233s
+  17               13.98         42.50       14.97           0.50/0.50     0.236s
+  18               14.15         42.11       15.15           0.50/0.50     0.234s
+  19               13.62         42.20       14.32           0.50/0.50     0.235s
+  20               15.27         33.52       18.33           0.50/0.50     0.235s
+  21               15.01         38.53       18.60           0.50/0.50     0.235s
+  22               14.55         38.76       15.68           0.50/0.50     0.235s
+  23               14.33         39.72       17.08           0.50/0.50     0.236s
+  24               14.10         33.60       14.32           0.50/0.50     0.230s
+  25               14.05         41.21       15.23           0.50/0.50     0.233s
+  26               14.49         35.19       15.53           0.50/0.50     0.233s
+  27               13.90         40.74       14.07           0.50/0.50     0.234s
+  28               13.96         41.64       14.54           0.50/0.50     0.232s
+
+=================================================================
+     FINAL RESULTS  [MOE mode | K=2 | mu=5000]
+=================================================================
+  Samples evaluated:      28
+  Total time:             9.08s
+  Avg time / image:       0.324s
+  GFLOPs / patch:         216.19
+
+  ── Noisy Baseline ────────────────────────────────────
+  PSNR-µ=5000 (RGB):    14.4491 dB
+
+  ── RGB Domain (Bayer denoised → GBTF → RGB) ─────────
+  PSNR-linear:            38.4682 dB
+  PSNR-µ=5000:          15.8642 dB  (delta +1.42 dB)
+  SSIM-linear:            0.8374
+  SSIM-µ=5000:          0.1324
+
+  ── Expert Routing ────────────────────────────────────
+  Avg % pixels with SNR < 0.5:  99.2%
+  Expert 0:  gate usage  49.7%   PSNR-µ=5000 15.8626 dB
+  Expert 1:  gate usage  50.2%   PSNR-µ=5000 15.8651 dB
+=================================================================
+
+  Full per-sample results: test_results/models_p1_moe_Teacher_MobileHDR_20260711_0931/results.csv
+  RGB visuals saved to:    test_results/models_p1_moe_Teacher_MobileHDR_20260711_0931/rgb/
+  Log saved to:            test_results/models_p1_moe_Teacher_MobileHDR_20260711_0931/log.txt
