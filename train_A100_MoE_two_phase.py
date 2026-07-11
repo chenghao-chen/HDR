@@ -309,7 +309,7 @@ if __name__ == "__main__":
 
     # Shared loss weights
     mu             = 5000   # µ-law tonemapping constant (Kalantari SIGGRAPH 2017)
-    aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
+    aux_weight     = 0.2  if MODE in ("moe", "dual") else 0.0
     balance_weight = 0.01 if MODE == "moe" else 0.0
 
     start_epoch = 0

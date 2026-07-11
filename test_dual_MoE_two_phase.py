@@ -193,7 +193,8 @@ def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
     expert_sum = torch.zeros((1, num_experts, 4, Hp, Wp), device=device)
     gate_sum   = torch.zeros((1, num_experts, Hp, Wp), device=device)
     weight_sum = torch.zeros((1, 1, Hp, Wp), device=device)
-    win        = torch.ones((1, 1, patch_size, patch_size), device=device)
+    hann_1d = torch.hann_window(patch_size, periodic=False, device=device)
+    win     = (hann_1d.unsqueeze(0) * hann_1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)  # [1,1,P,P]
 
     snr_full = estimate_local_snr_map(x_pad, window_size=5)
 
