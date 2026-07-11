@@ -61,9 +61,9 @@ def add_photon_noise(image: torch.Tensor, nbits: int = 10,
     image = ((image - rmin) / rng * pix_max) if rng > 1e-6 else (image * 0)
 
     if random_alpha:
-        # Peaks at 0 (true extreme low-light), range [0, 1]
-        alpha = abs(_rand(generator) - _rand(generator))
-        alpha = max(alpha, 0.1)    # avoid extremely dark scenes
+        # Uniform [0.1, 1.0] — covers the full exposure range including
+        # the full-brightness case used at test time (alpha=1.0).
+        alpha = 0.1 + 0.9 * _rand(generator)
     else:
         alpha = 1.0
 

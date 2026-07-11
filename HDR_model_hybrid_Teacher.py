@@ -426,6 +426,14 @@ class MoEDenoiser(nn.Module):
         # Gate and expert outputs are at the same packed Bayer resolution — no upsampling
         gates = self.gate(x, snr_map)                 # [B, K, H, W]
 
+        # Spatially blur gate weights to prevent hard routing boundaries that
+        # create visible blob artifacts at expert transitions. Kernel=33 blurs
+        # over ~33 packed pixels (66 sensor pixels). Re-normalise so weights
+        # still sum to 1 across experts.
+        gates = torch.nn.functional.avg_pool2d(
+            gates, kernel_size=33, stride=1, padding=16)
+        gates = gates / gates.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
         blended = (gates.unsqueeze(2) * expert_outs).sum(dim=1)  # [B, out_ch, H, W]
 
         if not self.training:
