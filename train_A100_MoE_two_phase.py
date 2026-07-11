@@ -286,9 +286,11 @@ if __name__ == "__main__":
         num_patch      = 8    # 8 virtual repeats per image per epoch
         lr             = 1e-4
         warmup_epochs  = 3     # short ramp; get to peak LR by epoch 3
-        num_epochs     = 200
+        num_epochs     = 50    # diagnostic: does the compressed cosine schedule
+                                # (eta_min by ~epoch 50) still reach the epoch-41
+                                # breakthrough seen in the 200-epoch K=2 run?
         eta_min        = 3e-5  # LR decays 1e-4→3e-5; stays active all 50 epochs
-        gamma          = 0.0   # perceptual weight (disabled: VGG domain mismatch on HDR Bayer)
+        gamma          = 0.1   # perceptual weight (matches last non-collapsed run, 20260711_0142)
         grad_clip      = 1.0
         rollback_mult  = 3.0   # tighter than Phase 2; batch 8 has low variance
         LPIPS_CROP     = 256   # Bayer-resolution crop fed to LPIPS (pseudo-RGB)
@@ -309,7 +311,7 @@ if __name__ == "__main__":
 
     # Shared loss weights
     mu             = 5000   # µ-law tonemapping constant (Kalantari SIGGRAPH 2017)
-    aux_weight     = 0.2  if MODE in ("moe", "dual") else 0.0
+    aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
     balance_weight = 0.01 if MODE == "moe" else 0.0
 
     start_epoch = 0
