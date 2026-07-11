@@ -27,6 +27,8 @@ import sys
 import time
 import math
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -164,6 +166,45 @@ def bayer_to_rgb(packed, gbtf_module):
 def save_jpg(tensor, path, quality=92):
     """Save a [C, H, W] float tensor as JPEG."""
     to_pil_image(tensor.clamp(0, 1).cpu()).save(path, format="JPEG", quality=quality)
+
+
+def colorize_gate(gate_map, colormap=cv2.COLORMAP_VIRIDIS):
+    """[H, W] gate weights in [0, 1] -> [3, H, W] RGB heatmap tensor in [0, 1]."""
+    arr = (gate_map.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    heat_bgr = cv2.applyColorMap(arr, colormap)
+    heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(heat_rgb).permute(2, 0, 1).float() / 255.0
+
+
+# Distinct colors for up to 10 experts in the argmax routing map.
+_GATE_PALETTE = torch.tensor([
+    [230, 25, 75], [60, 180, 75], [255, 225, 25], [0, 130, 200], [245, 130, 48],
+    [145, 30, 180], [70, 240, 240], [240, 50, 230], [210, 245, 60], [250, 190, 212],
+], dtype=torch.float32) / 255.0
+
+
+def gate_argmax_map(gates):
+    """[K, H, W] softmax gate weights -> [3, H, W] RGB, one flat color per dominant expert."""
+    K = gates.shape[0]
+    idx = gates.argmax(dim=0)
+    palette = _GATE_PALETTE[:K].to(gates.device)
+    return palette[idx].permute(2, 0, 1)
+
+
+def save_gate_visualization(gates, path):
+    """
+    gates: [K, H, W] softmax gate weights (packed-Bayer resolution, already
+    matching the halved RGB visuals' H×W — see main loop).
+    Saves a side-by-side row: per-expert heatmap(s), then the argmax routing map.
+    """
+    K = gates.shape[0]
+    panels = [colorize_gate(gates[k]) for k in range(K)]
+    panels.append(gate_argmax_map(gates))
+    sep = torch.ones(3, panels[0].shape[1], 2)
+    row = panels[0]
+    for p in panels[1:]:
+        row = torch.cat([row, sep.to(p.device), p], dim=2)
+    save_jpg(row, path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +520,12 @@ if __name__ == "__main__":
                 save_jpg(vis_pred[0],   os.path.join(OUTPUT_DIR, "rgb", f"sample_{i:04d}_denoised.jpg"))
                 save_jpg(vis_gt[0],     os.path.join(OUTPUT_DIR, "rgb", f"sample_{i:04d}_gt.jpg"))
                 save_jpg(vis_noisy[0],  os.path.join(OUTPUT_DIR, "rgb", f"sample_{i:04d}_noisy.jpg"))
+
+                # Gate routing map: gates is [1,K,H,W] at packed-Bayer resolution,
+                # which equals vis_*'s H×W after the 0.5x downsample above (2H*0.5=H).
+                # Panels: expert0 heatmap | expert1 heatmap | ... | argmax routing map.
+                save_gate_visualization(
+                    gates[0], os.path.join(OUTPUT_DIR, "rgb", f"sample_{i:04d}_gates.jpg"))
 
     csv_file.close()
 
