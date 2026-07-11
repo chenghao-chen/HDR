@@ -7,9 +7,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=40G
-#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=4      # matches num_workers=4 in test_dual_MoE_two_phase.py
+#SBATCH --mem=16G              # 9 completed runs peaked at 6.90GB RSS; ~2.3x headroom
+#SBATCH --time=00:15:00        # longest completed run was 202s (3.4min); ~4.4x headroom
 
 # 1. Ensure directory structures exist
 mkdir -p logs

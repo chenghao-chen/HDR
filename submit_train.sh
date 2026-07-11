@@ -7,9 +7,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8      # <-- Increased from 4 to feed the bigger batches fast
-#SBATCH --mem=80G              # <-- Scaled up memory headroom for batch data expansion
-#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=8      # matches num_workers=8 in Phase 1 (Phase 2 uses 4)
+#SBATCH --mem=24G              # 7 completed runs peaked at 12.7GB RSS; ~1.9x headroom
+#SBATCH --time=08:00:00        # longest completed run was 3.37h (200-epoch Phase 1);
+                                # ~2.4x headroom since Phase 2 timing isn't measured yet
 
 # 1. Ensure directory structures exist
 mkdir -p logs
