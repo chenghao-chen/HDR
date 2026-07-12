@@ -249,7 +249,7 @@ if __name__ == "__main__":
     #  TOP-LEVEL FLAGS  — the only lines you change between runs
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     PHASE       = 1        # 1 = patch training  |  2 = full-res fine-tune
-    MODE        = "single" # "moe" | "dual" | "single"
+    MODE        = "moe"    # "moe" | "dual" | "single"
     NUM_EXPERTS = 2        # MoE only: experts across noise levels
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
                            # stable torch+inductor on the cluster)
@@ -262,9 +262,21 @@ if __name__ == "__main__":
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     # ── Paths ─────────────────────────────────────────────────────────
-    timestamp_str    = datetime.now().strftime("%Y%m%d_%H%M")
-    mode_tag         = MODE
-    save_folder      = (f"models_p{PHASE}_{mode_tag}_Teacher_"f"MobileHDR_{timestamp_str}/")
+    # Seconds-resolution timestamp (was minute-only) so two runs submitted
+    # close together don't collide on save_folder — previously two "moe"
+    # runs with different K starting in the same clock-minute would
+    # silently share latest.pth / phase1_best.pth / the log file,
+    # corrupting whichever one lost the race (one could even hit the
+    # strict-load resume path and try to load a checkpoint with a
+    # different number of expert heads). NUM_EXPERTS is folded into the
+    # folder name too, so a checkpoint's K is visible without opening it.
+    timestamp_str    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode_tag         = MODE   # stored in the checkpoint as ckpt["mode"] — must
+                               # stay exactly "moe"/"dual"/"single" (build_denoiser
+                               # in the test script matches on this literally)
+    folder_tag       = MODE if MODE != "moe" else f"moe-K{NUM_EXPERTS}"
+    save_folder      = (f"models_p{PHASE}_{folder_tag}_Teacher_"
+                         f"MobileHDR_{timestamp_str}/")
     dataset_dir      = "/scratch/gilbreth/chen4848/datasets/Mobile-HDR"
     create_folder(save_folder)
 
