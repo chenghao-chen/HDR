@@ -1,0 +1,71 @@
+#!/bin/bash -l
+#PBS -N hdr_train
+#PBS -A lighthouse-purdue
+#PBS -q prod
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l walltime=08:00:00
+#PBS -l filesystems=home:flare
+#PBS -r y
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Training on Aurora — 1 node, 1 Max 1550 tile (64 GB HBM).
+#
+#   qsub scripts/aurora/train.pbs
+#   qsub -v HDR_SAVE_FOLDER=models_p1_moe_aurora02/ scripts/aurora/train.pbs
+#
+# Differences from the Polaris script, all of them consequences of the
+# machine rather than choices:
+#
+#   -A          the Aurora allocation is a separate award from the Polaris
+#               one and may well have a different name. Change it here and in
+#               HDR_PROJECT if `qsub` rejects the account.
+#   -q prod     Aurora's prod queue accepts single-node jobs, so an 8-hour
+#               run does not have to be preemptable the way it does on
+#               Polaris. If prod rejects a 1-node job on your allocation,
+#               check `qstat -Qf` and resubmit with -q on the command line.
+#   select=1    no `system=` selector here; that is a Polaris-ism.
+#   filesystems eagle is not mounted on Aurora. The data has to be staged
+#               onto flare first — scripts/stage_data.sh does that.
+#   device      xpu, not cuda. Handled entirely inside hdr_platform; nothing
+#               in this script or the training script names a backend.
+#
+# -r y and the pinned HDR_SAVE_FOLDER are kept even though prod does not
+# preempt: a node failure requeues the job either way, and resuming from
+# latest.pth is what makes that harmless.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+
+# Pinned, not timestamped: a requeue must resume, not restart from epoch 0.
+export HDR_SAVE_FOLDER="${HDR_SAVE_FOLDER:-models_p1_moe_Teacher_MobileHDR_aurora01/}"
+
+hdr::banner
+
+if [[ -f "$HDR_SAVE_FOLDER/latest.pth" ]]; then
+    hdr::log "Found $HDR_SAVE_FOLDER/latest.pth -> training will RESUME."
+else
+    hdr::log "No checkpoint in $HDR_SAVE_FOLDER -> training starts from scratch."
+fi
+
+hdr::preflight || hdr::die "environment is not usable; not starting an 8-hour run"
+
+# Single-device: 11 of the node's 12 tiles sit idle. Using them would need
+# DDP with the oneCCL backend, which is a code change, not a flag.
+hdr::run "$HDR_PYTHON" train_A100_MoE_two_phase.py
+status=$?
+
+# ── Phase 2 note ────────────────────────────────────────────────────────────
+# 64 GB per tile against a Polaris A100's 40 GB. The full-resolution Phase 2
+# fine-tune that is expected to OOM on Polaris has a real chance of fitting
+# here — this is the machine to try it on. Watch the peak-memory line that
+# scripts/gpu_smoke.py prints for the full-resolution pass before committing
+# to an 8-hour Phase 2 run.
+
+exit $status

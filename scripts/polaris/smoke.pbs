@@ -1,0 +1,56 @@
+#!/bin/bash -l
+#PBS -N hdr_smoke
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:20:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Polaris GPU smoke test — run this FIRST, before any long job.
+#
+#   qsub scripts/polaris/smoke.pbs
+#
+# Two stages:
+#   1. the full pytest suite, where the gpu-marked tests (which auto-skip on
+#      a login node) actually execute,
+#   2. scripts/gpu_smoke.py — a real train step and a full-resolution
+#      inference pass on the real Mobile-HDR data.
+#
+# Twenty minutes in the debug queue against eight hours of a preemptable job
+# that dies on its first CUDA call.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::preflight --strict
+preflight_status=$?
+
+hdr::log ""
+hdr::log "################ 1. pytest suite (gpu tests now active) ################"
+./run_tests.sh -q
+suite_status=$?
+
+hdr::log ""
+hdr::log "################ 2. GPU forward/backward + full-res eval ##############"
+"$HDR_PYTHON" scripts/gpu_smoke.py
+smoke_status=$?
+
+hdr::head
+hdr::log "preflight   exit : $preflight_status  (2 = warnings only)"
+hdr::log "pytest      exit : $suite_status"
+hdr::log "gpu smoke   exit : $smoke_status"
+hdr::log "finished         : $(date)"
+hdr::head
+
+# Warnings from the preflight are not a failure; the other two are.
+(( suite_status == 0 && smoke_status == 0 )) || exit 1
+exit 0

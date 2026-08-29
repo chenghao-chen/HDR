@@ -1,0 +1,45 @@
+#!/bin/bash -l
+#PBS -N hdr_test
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:flare
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Evaluation on Aurora.
+#
+#   qsub scripts/aurora/test.pbs
+#   qsub -v HDR_CHECKPOINT=models_.../phase1_best.pth scripts/aurora/test.pbs
+#
+# Checkpoints are portable between the two machines: they hold CPU-side
+# tensors, and the eval script maps them onto whichever device is present.
+# A model trained on Polaris can be evaluated here and vice versa — the
+# numbers will differ in the last decimal because bf16 rounds differently on
+# the two backends, not because anything is wrong.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+
+export HDR_CHECKPOINT="${HDR_CHECKPOINT:-models_p1_moe_Teacher_MobileHDR_aurora01/phase1_best.pth}"
+
+hdr::banner
+
+if [[ ! -f "$HDR_CHECKPOINT" ]]; then
+    hdr::log "FATAL: checkpoint not found: $HDR_CHECKPOINT"
+    hdr::log "Available checkpoints:"
+    ls -1 models_*/*.pth 2>/dev/null || hdr::log "  (none — train first)"
+    exit 1
+fi
+
+hdr::preflight || hdr::warn "continuing despite check failures"
+
+hdr::run "$HDR_PYTHON" test_dual_MoE_two_phase.py
+exit $?

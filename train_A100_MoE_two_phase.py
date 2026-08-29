@@ -68,10 +68,18 @@ import wandb
 from HDR_model_hybrid_Teacher import build_denoiser, estimate_local_snr_map
 from HDR_Mobile_dataset import MobileHDRDataset
 from DifferentiableGBTF_BGGR import DifferentiableGBTF_BGGR
+from hdr_platform import (get_accelerator, resolve_dataset_dir,
+                          resolve_project_root)
 
-os.environ["WANDB_CACHE_DIR"] = "/scratch/gilbreth/chen4848/wandb_cache"
-os.environ["WANDB_DATA_DIR"]  = "/scratch/gilbreth/chen4848/wandb_data"
-os.environ["WANDB_DIR"]       = "/scratch/gilbreth/chen4848/projects/HDR-denoise"
+# setdefault (not assignment) so a job script can point these at
+# cluster-appropriate scratch space. The fallback follows whichever machine
+# this is running on — eagle on Polaris, flare on Aurora — because W&B
+# scratch is far too large for a /home quota and the original Gilbreth
+# paths do not exist on either system.
+_WANDB_ROOT = resolve_project_root()
+os.environ.setdefault("WANDB_CACHE_DIR", os.path.join(_WANDB_ROOT, "wandb_cache"))
+os.environ.setdefault("WANDB_DATA_DIR",  os.path.join(_WANDB_ROOT, "wandb_data"))
+os.environ.setdefault("WANDB_DIR",       os.path.join(_WANDB_ROOT, "wandb_runs"))
 
 
 ##########################################################################
@@ -214,17 +222,19 @@ def make_d4_transform(allow_transpose: bool):
 
 if __name__ == "__main__":
 
-    # ── A100 matmul / TF32 optimisations ──────────────────────────────
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32       = True
-    torch.set_float32_matmul_precision("high")
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # ── Device and reduced-precision matmul ───────────────────────────
+    # cuda:0 on Polaris, xpu:0 on Aurora, cpu on a login node. The matmul
+    # setting is TF32 on A100 tensor cores and the equivalent fast path on
+    # Intel Xe; roughly 2x throughput for negligible precision loss.
+    ACC    = get_accelerator()
+    device = ACC.device
+    ACC.enable_fast_matmul()
 
     # ── Reproducibility ───────────────────────────────────────────────
+    # seed_all covers the host RNG plus whichever device RNG is in play;
+    # torch.cuda.manual_seed_all is a silent no-op on an Intel GPU.
     seed = 21
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    ACC.seed_all(seed)
     random.seed(seed)
 
     def seed_worker(worker_id):
@@ -252,9 +262,17 @@ if __name__ == "__main__":
     # ── Paths ─────────────────────────────────────────────────────────
     timestamp_str    = datetime.now().strftime("%Y%m%d_%H%M")
     mode_tag         = MODE
-    save_folder      = (f"models_p{PHASE}_{mode_tag}_Teacher_"f"MobileHDR_{timestamp_str}/")
-    # save_folder      = "models_p1_moe_Teacher_MobileHDR_20260605_0848/"
-    dataset_dir      = "/scratch/gilbreth/chen4848/datasets/Mobile-HDR"
+    # HDR_SAVE_FOLDER pins the run directory to a fixed name. Required on
+    # preemptable queues: the default timestamped folder changes on every
+    # restart, so latest.pth is never found and the run silently starts over.
+    save_folder      = os.environ.get(
+        "HDR_SAVE_FOLDER",
+        f"models_p{PHASE}_{mode_tag}_Teacher_MobileHDR_{timestamp_str}/")
+    if not save_folder.endswith("/"):
+        save_folder += "/"
+    # HDR_DATASET_DIR still wins; the fallback is now this machine's data
+    # location rather than a Gilbreth path that exists on neither system.
+    dataset_dir      = resolve_dataset_dir("Mobile-HDR")
     create_folder(save_folder)
 
     # Checkpoint paths inside this run's save folder
@@ -384,11 +402,13 @@ if __name__ == "__main__":
     ), newfile=True)
 
     # ── Optimizer + scheduler ─────────────────────────────────────────
-    # fused Adam: single multi-tensor CUDA kernel per step (A100 speedup)
+    # fused Adam: one multi-tensor CUDA kernel per step (A100 speedup). It is
+    # a CUDA-only fast path — asking for it on an Intel GPU raises — so
+    # optimizer_kwargs drops the flag on any other backend.
     try:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr,
-                                     betas=(0.9, 0.999),
-                                     fused=torch.cuda.is_available())
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            **ACC.optimizer_kwargs(lr=lr, betas=(0.9, 0.999)))
     except (TypeError, RuntimeError):
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
     scheduler = build_scheduler(optimizer, warmup_epochs, num_epochs, eta_min)
@@ -464,16 +484,17 @@ if __name__ == "__main__":
         num_patch=num_patch,
         crop_size=crop_size,
     )
+    # pin_memory has to name its target device on XPU: the DataLoader
+    # default pins for CUDA, so on Aurora a bare pin_memory=True gives up
+    # the transfer speedup without saying so.
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_sz,
         shuffle=True,
-        num_workers=8 if PHASE == 1 else 4,
-        pin_memory=True,
-        persistent_workers=True,
         collate_fn=collate_fn,
         worker_init_fn=seed_worker,
         generator=worker_gen,
+        **ACC.dataloader_kwargs(num_workers=8 if PHASE == 1 else 4),
     )
 
     n_batches = len(dataloader)
@@ -528,7 +549,7 @@ if __name__ == "__main__":
                 optimizer.zero_grad(set_to_none=True)
 
                 # ── Forward + losses ─────────────────────────────────
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with ACC.autocast(torch.bfloat16):
 
                     # 1. Forward pass (unified across moe/dual/single).
                     #    y_pred:      [B, 3, Hs, Ws]    sensor-resolution RGB
