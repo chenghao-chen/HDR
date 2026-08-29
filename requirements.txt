@@ -3,3 +3,6 @@ torchvision
 numpy
 opencv-python
 lpips
+wandb
+torchinfo
+pillow

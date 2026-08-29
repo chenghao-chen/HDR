@@ -31,6 +31,7 @@ from torchvision.transforms.functional import to_pil_image
 from HDR_model_hybrid_Teacher import build_denoiser, estimate_local_snr_map
 from HDR_Mobile_dataset import MobileHDRDataset
 from DifferentiableGBTF_BGGR import DifferentiableGBTF_BGGR
+from hdr_platform import get_accelerator, resolve_dataset_dir
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,16 +171,24 @@ def save_jpg(tensor, path, quality=92):
 # Inference
 # ─────────────────────────────────────────────────────────────────────────────
 def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
-                  device='cuda'):
+                  device=None):
     """
     Runs the model on a single [1, 4, H, W] Bayer image using overlapping patches.
     The model outputs sensor-resolution RGB, so each patch at (H_bayer, W_bayer)
     produces an output at (2*H_bayer, 2*W_bayer). Accumulation is done at sensor res.
 
+    `device` defaults to the input tensor's own device, so the accumulators
+    land beside the data instead of on a hardcoded 'cuda'.
+
     Returns: (blended [1,3,2H,2W],
               expert_outs [1,K,3,2H,2W],
               gates [1,K,2H,2W])
     """
+    device = noisy_bayer.device if device is None else device
+    # Autocast needs the backend's own name: 'cuda' on Polaris, 'xpu' on
+    # Aurora. A literal 'cuda' raises on an Intel GPU.
+    acc = get_accelerator(str(device))
+
     _, _, H, W = noisy_bayer.shape    # Bayer resolution
     stride = patch_size - overlap
 
@@ -205,7 +214,7 @@ def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
             patch    = x_pad[:, :, yi:yi+patch_size, xi:xi+patch_size]
             snr_crop = snr_full[:, :, yi:yi+patch_size, xi:xi+patch_size]
 
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with acc.autocast(torch.bfloat16):
                 pred, experts, gates = model(patch, snr_crop)
 
             # Output offsets at sensor resolution
@@ -224,7 +233,7 @@ def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
     )
 
 
-def infer_full(model, noisy_bayer, device='cuda'):
+def infer_full(model, noisy_bayer, device=None):
     """
     Full-resolution inference — no patches, no blending artifacts.
 
@@ -244,7 +253,8 @@ def infer_full(model, noisy_bayer, device='cuda'):
 
     snr_map = estimate_local_snr_map(x, window_size=5)
 
-    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+    acc = get_accelerator(str(noisy_bayer.device if device is None else device))
+    with acc.autocast(torch.bfloat16):
         pred, experts, gates = model(x, snr_map)
 
     # Crop back to the unpadded sensor size (2× the original Bayer dims)
@@ -257,7 +267,7 @@ def infer_full(model, noisy_bayer, device='cuda'):
 # ─────────────────────────────────────────────────────────────────────────────
 # FLOPs estimation
 # ─────────────────────────────────────────────────────────────────────────────
-def estimate_flops(model, patch_size=256, device='cuda'):
+def estimate_flops(model, patch_size=256, device=None):
     """
     Estimates GFLOPs for one patch_size² patch using torchinfo.
     Call BEFORE torch.compile — torchinfo probes many shapes, which would
@@ -268,6 +278,7 @@ def estimate_flops(model, patch_size=256, device='cuda'):
         from torchinfo import summary
 
         # Input is packed Bayer (patch_size × patch_size); SNR map is also at Bayer res.
+        device = next(model.parameters()).device if device is None else device
         dummy_x   = torch.zeros(1, 4, patch_size, patch_size, device=device)
         dummy_snr = torch.zeros(1, 1, patch_size, patch_size, device=device)
         # Output will be RGB at (2*patch_size × 2*patch_size) sensor resolution.
@@ -291,18 +302,23 @@ def estimate_flops(model, patch_size=256, device='cuda'):
 # Main evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # ── Performance flags ──────────────────────────────────────────────────
-    # TF32 gives ~2x throughput on A100 tensor cores with negligible precision loss
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32       = True
-    torch.set_float32_matmul_precision('high')
+    # ── Device and performance flags ───────────────────────────────────────
+    # Picks cuda:0 on Polaris, xpu:0 on Aurora, cpu elsewhere, and enables
+    # the reduced-precision matmul path each backend offers (TF32 on the
+    # A100's tensor cores; the equivalent fast path on Intel Xe).
+    ACC = get_accelerator()
+    ACC.enable_fast_matmul()
 
     # ── Configuration ──────────────────────────────────────────────────────
-    DATASET_DIR    = "/scratch/gilbreth/chen4848/datasets/Mobile-HDR"
+    # Falls back to this machine's dataset location rather than the Gilbreth
+    # path this script was written against, which exists on neither ALCF system.
+    DATASET_DIR    = resolve_dataset_dir("Mobile-HDR")
     # Update this to the phase{1,2}_best.pth from your latest training run.
     # Naming: models_p{PHASE}_{mode}_Teacher_MobileHDR_{timestamp}/phase{PHASE}_best.pth
     # CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260605_0848/phase1_best.pth"
-    CHECKPOINT     = "models_p1_moe_Teacher_MobileHDR_20260619_0059/phase1_best.pth"
+    CHECKPOINT     = os.environ.get(
+        "HDR_CHECKPOINT",
+        "models_p1_moe_Teacher_MobileHDR_20260619_0059/phase1_best.pth")
     OUTPUT_DIR     = f"test_results/{CHECKPOINT.split('/')[0]}"
     INFERENCE      = "full"          # "full" | "patches"
     PATCH_SIZE     = 1024
@@ -311,7 +327,7 @@ if __name__ == "__main__":
     # mu=5000 matches training (train_A100_MoE_two_phase.py uses mu=5000).
     # Using a different value makes test PSNR-µ incomparable to W&B training curves.
     METRIC_MU      = 5000
-    DEVICE         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    DEVICE         = ACC.device
     # torch.compile: test images vary in size, so full-res inference triggers
     # one (slow) recompile per distinct shape. Enable only for fixed-size or
     # patch-based runs.
@@ -420,7 +436,9 @@ if __name__ == "__main__":
             pct_low  = (snr_full < 0.5).float().mean().item() * 100.0
 
             # ── Timed inference ────────────────────────────────────────
-            torch.cuda.synchronize()
+            # Sync before and after: kernels are queued asynchronously, so
+            # without these the timer measures submission, not execution.
+            ACC.synchronize()
             t0 = time.perf_counter()
 
             if INFERENCE == "patches":
@@ -430,11 +448,11 @@ if __name__ == "__main__":
             else:
                 y_pred, expert_outs, gates = infer_full(model, x, device=DEVICE)
 
-            torch.cuda.synchronize()
+            ACC.synchronize()
             elapsed = time.perf_counter() - t0
 
             # ── Demosaic GT and noisy for comparison (y_pred is already RGB) ──
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with ACC.autocast(torch.bfloat16):
                 rgb_gt    = gbtf(packed_bayer_to_mosaic(y.clamp(0, 1).float())).clamp(0, 1).float()
                 rgb_noisy = gbtf(packed_bayer_to_mosaic(x.clamp(0, 1).float())).clamp(0, 1).float()
 

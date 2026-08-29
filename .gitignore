@@ -1,0 +1,19 @@
+# Secrets — submit scripts source this for WANDB_API_KEY. Never commit it.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Job logs and PBS/SLURM stdout-stderr staging
+logs/
+*.o[0-9]*
+*.e[0-9]*
+
+# Training artifacts (checkpoints are large; keep them off git)
+models_*/
+test_results/
+wandb/
+
+# oneAPI JIT kernel cache (Aurora). Hundreds of MB, regenerated on demand.
+.sycl_cache/

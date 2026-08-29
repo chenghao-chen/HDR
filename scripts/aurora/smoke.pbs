@@ -1,0 +1,65 @@
+#!/bin/bash -l
+#PBS -N hdr_smoke
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:flare
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Aurora GPU smoke test — run this FIRST, and read the output carefully.
+#
+#   qsub scripts/aurora/smoke.pbs
+#
+# This is the job that matters most on Aurora, because it is the first thing
+# that has ever exercised this code on Intel GPUs. The failure modes it is
+# looking for are specific to the port:
+#
+#   * an operator with no XPU kernel (it either raises or falls back to the
+#     CPU and destroys throughput),
+#   * bf16 autocast producing non-finite values where CUDA does not,
+#   * torch.xpu missing entirely because the frameworks module did not load,
+#   * pinned-memory settings that need pin_memory_device="xpu".
+#
+# A longer walltime than the Polaris equivalent: the first XPU run pays for
+# JIT-compiling every kernel into the SYCL cache, which is slow once and
+# fast thereafter.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::log "device hierarchy : ZE_FLAT_DEVICE_HIERARCHY=${ZE_FLAT_DEVICE_HIERARCHY:-unset}"
+hdr::log "  FLAT      = 12 devices/node, 64 GB each (one tile per device)"
+hdr::log "  COMPOSITE =  6 devices/node, 128 GB each (implicit tile scaling)"
+hdr::rule
+
+hdr::preflight --strict
+preflight_status=$?
+
+hdr::log ""
+hdr::log "################ 1. pytest suite (gpu tests now active) ################"
+./run_tests.sh -q
+suite_status=$?
+
+hdr::log ""
+hdr::log "################ 2. GPU forward/backward + full-res eval ##############"
+"$HDR_PYTHON" scripts/gpu_smoke.py
+smoke_status=$?
+
+hdr::head
+hdr::log "preflight   exit : $preflight_status  (2 = warnings only)"
+hdr::log "pytest      exit : $suite_status"
+hdr::log "gpu smoke   exit : $smoke_status"
+hdr::log "finished         : $(date)"
+hdr::head
+
+(( suite_status == 0 && smoke_status == 0 )) || exit 1
+exit 0
