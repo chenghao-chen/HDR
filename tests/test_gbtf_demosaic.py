@@ -357,10 +357,6 @@ def test_smooth_chromatic_scene_reconstructs_well_in_the_interior(gbtf):
 # step 4 sums HCD over +/-4 -> at most 8 mosaic pixels in each direction.
 
 @pytest.mark.parametrize("axis", [2, 3])
-@pytest.mark.xfail(reason="BUG: torch.roll in step 3 wraps the direction-weight "
-                          "maps around the image, so border pixels are "
-                          "interpolated using content from the opposite edge",
-                   strict=False)
 def test_output_depends_only_on_a_local_neighbourhood(gbtf, axis):
     """
     Perturbing the last four rows/columns of a 32x32 mosaic must not change the
@@ -389,9 +385,6 @@ def test_output_depends_only_on_a_local_neighbourhood(gbtf, axis):
         f"far-edge content changed the opposite border by {float(delta)}"
 
 
-@pytest.mark.xfail(reason="BUG: torch.roll in step 3 wraps the direction-weight "
-                          "maps, so d(out[0,0]) / d(input at the far edge) != 0",
-                   strict=False)
 def test_gradient_support_of_a_corner_pixel_is_local(gbtf):
     """
     The autograd view of the same defect, and the sharper statement: the
@@ -533,10 +526,6 @@ def test_kernel_constants_are_the_gbtf_ones(gbtf):
     assert torch.equal(prb, prb.t())
 
 
-@pytest.mark.xfail(reason="BUG: Prb uses -0.0313 instead of -1/32 = -0.03125, "
-                          "so its DC gain is 0.9996 and R/B pick up a "
-                          "systematic ~4e-4 bias",
-                   strict=False)
 def test_prb_kernel_has_unit_dc_gain(gbtf):
     """
     Every other Prb tap is an exact 32nd (0.3125 = 10/32) and the reference

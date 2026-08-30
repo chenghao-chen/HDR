@@ -51,6 +51,21 @@ from blocks_Restormer import RestormerBlock
 
 _CLAMP_EPS = 1.0 / (2 ** 20 - 1)
 
+# Initial output level of a fresh ExpertHead. Two constraints:
+#
+#   * strictly above _CLAMP_EPS, with margin. The expert heads have no
+#     residual path around proj_out, so whatever proj_out emits IS the
+#     prediction, and a prediction at or below the clamp floor has exactly
+#     zero gradient. This value is ~5000x the floor.
+#   * near the data's own scale, so training does not spend its first epochs
+#     just correcting a global brightness offset. 0.005 is the measured mean
+#     linear intensity of the Mobile-HDR training split (HDR linear data is
+#     mostly dark; the mu-law mean is a much larger 0.25).
+#
+# The exact value is not critical — anything well clear of the floor and
+# roughly at the data scale behaves the same.
+_INIT_OUT_LEVEL = 0.005
+
 
 # ---------------------------------------------------------
 # 0. Shared utilities
@@ -289,7 +304,13 @@ class NoiseGate(nn.Module):
     to the expert outputs which are at full sensor resolution.
 
     in_channels is always 5: 4 BGGR Bayer channels + 1 SNR channel.
-    The final conv is zero-initialised so training starts from uniform routing.
+
+    The final conv is initialised small (std 1e-3) rather than exactly zero.
+    Exact zeros give uniform routing at step 0, which is what we want, but they
+    also make d(logits)/d(hidden) identically zero, so the two hidden convs sit
+    frozen until the final layer drifts off zero. A small non-zero scale starts
+    routing effectively uniform (logit spread ~1e-3 => gates within 0.1% of 1/K)
+    while keeping the whole gate trainable from the first step.
     """
     def __init__(self, num_experts, in_channels=5, hidden=16):
         super().__init__()
@@ -300,7 +321,7 @@ class NoiseGate(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden, num_experts, kernel_size=1),
         )
-        nn.init.zeros_(self.net[-1].weight)
+        nn.init.normal_(self.net[-1].weight, std=1e-3)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x, snr_map):
@@ -316,8 +337,20 @@ class ExpertHead(nn.Module):
     residual blocks, then two PixelShuffle(2) stages:
       1st: H/2 -> H  (back to packed Bayer resolution)
       2nd: H   -> 2H (sensor resolution — the demosaicing upsampling)
-    The final 1×1 conv is zero-initialised so each expert starts as a
-    near-zero prediction and the blended output starts near zero.
+    The final 1×1 conv starts as a small-variance perturbation around a dim
+    positive constant (_INIT_OUT_LEVEL), so a fresh expert predicts a nearly
+    uniform dark image rather than noise.
+
+    That keeps the original "each expert starts from a neutral prediction"
+    intent, but strictly ABOVE the output floor. proj_out used to be
+    zero-initialised, which put the raw head output at exactly 0.0 — and
+    MoEDenoiser.forward clamps to min=_CLAMP_EPS, where clamp's backward is
+    zero. Every output element sat on the floor, so no gradient reached any
+    parameter in the model, proj_out included, and it could not bootstrap out
+    at any learning rate. Plain default init fixes the gradient but is
+    zero-mean, which leaves ~50% of output pixels on the floor at step 0; the
+    positive bias puts essentially all of them above it.
+    See tests/test_model_moe.py::test_fresh_model_produces_nonzero_gradients.
     """
     def __init__(self, in_dim, out_channels=3, num_blocks=2, se_reduction=8):
         super().__init__()
@@ -332,8 +365,8 @@ class ExpertHead(nn.Module):
         # Maps r channels -> out_channels*4 for the second PixelShuffle(2)
         self.proj_out = nn.Conv2d(r, out_channels * 4, kernel_size=1)
         self.up2 = nn.PixelShuffle(2)                 # -> (out_channels, 2H, 2W)
-        nn.init.zeros_(self.proj_out.weight)
-        nn.init.zeros_(self.proj_out.bias)
+        nn.init.normal_(self.proj_out.weight, std=1e-3)
+        nn.init.constant_(self.proj_out.bias, _INIT_OUT_LEVEL)
 
     def forward(self, feat):
         z = self.blocks(feat)

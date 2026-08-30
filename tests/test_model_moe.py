@@ -285,6 +285,13 @@ def test_blending_identity_is_broken_by_the_eval_clamp(tiny_kwargs):
     """
     model = _moe(tiny_kwargs, num_experts=2)
     with torch.no_grad():
+        # Zero the weights so each expert is its bias alone, and zero the gate
+        # head so routing is exactly 1/K. Neither is zero-initialised any more
+        # (that combination made the model untrainable), so this test sets up
+        # the exact-arithmetic condition it needs for itself.
+        for head in model.experts:
+            head.proj_out.weight.zero_()
+        model.gate.net[-1].weight.zero_()
         model.experts[0].proj_out.bias.fill_(4.0)    # way above 1.0
         model.experts[1].proj_out.bias.fill_(0.0)    # pinned to the eps floor
     x, snr = _inputs(1, 16, 16, seed=7)
@@ -308,64 +315,72 @@ def test_blending_identity_is_broken_by_the_eval_clamp(tiny_kwargs):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("K", [1, 2, 3, 4])
-def test_fresh_model_outputs_exactly_clamp_eps(tiny_kwargs, K):
+def test_fresh_model_output_clears_the_clamp_floor(tiny_kwargs, K):
     """
-    Documented zero-init contract: every ExpertHead.proj_out (weight AND bias)
-    is zeroed at construction, so a fresh model in train mode emits exactly
-    _CLAMP_EPS for every expert pixel, and — because the gates sum to 1 —
-    the blend is _CLAMP_EPS too.
+    A fresh model must emit a varied, input-dependent prediction that mostly
+    sits ABOVE _CLAMP_EPS.
 
-    This is the "training starts from a neutral prediction" guarantee; a
-    non-zero init would make the first epochs of the MoE phase diverge.
+    This is the regression guard for the init bug. proj_out used to be
+    zero-initialised, so every expert emitted exactly 0.0, the
+    clamp(min=_CLAMP_EPS) in forward pinned every element to the floor, and
+    clamp's zero backward below the floor killed every gradient in the model —
+    permanently, since proj_out could not learn its way out either. A model
+    whose output is a constant at the floor is a model that cannot train.
     """
     model = _moe(tiny_kwargs, num_experts=K)
     for j, head in enumerate(model.experts):
-        assert torch.equal(head.proj_out.weight,
-                           torch.zeros_like(head.proj_out.weight)), \
-            f"expert {j} proj_out.weight is not zero-initialised"
-        assert torch.equal(head.proj_out.bias,
-                           torch.zeros_like(head.proj_out.bias)), \
-            f"expert {j} proj_out.bias is not zero-initialised"
+        assert float(head.proj_out.weight.abs().max()) > 0.0, \
+            f"expert {j} proj_out.weight is zero-initialised — this kills every gradient"
 
     x, snr = _inputs(1, 16, 16, seed=8)
     model.train()
     blended, expert_outs, _ = model(x, snr)
 
-    eps_e = torch.full_like(expert_outs, _CLAMP_EPS)
-    assert torch.equal(expert_outs, eps_e), \
-        "fresh expert outputs are not exactly _CLAMP_EPS"
-    eps_b = torch.full_like(blended, _CLAMP_EPS)
-    assert torch.allclose(blended, eps_b, rtol=1e-6, atol=0.0), \
-        "fresh blended output is not _CLAMP_EPS"
+    assert torch.isfinite(blended).all() and torch.isfinite(expert_outs).all()
+    assert float(expert_outs.std()) > 0.0, "fresh expert outputs are constant"
+    assert float(blended.std()) > 0.0, "fresh blended output is constant"
+
+    # Essentially nothing may start on the floor. proj_out is initialised
+    # around a dim POSITIVE constant precisely so this holds: a plain zero-mean
+    # init would leave ~50% of pixels clipped and gradient-free at step 0.
+    on_floor = (expert_outs <= _CLAMP_EPS).float().mean()
+    assert float(on_floor) < 0.01, \
+        f"{100 * float(on_floor):.1f}% of expert output sits on the clamp floor; " \
+        "gradients are being killed there"
 
 
 @pytest.mark.parametrize("K", [1, 2, 3, 4])
-def test_fresh_gate_is_uniform_one_over_k(tiny_kwargs, K):
+def test_fresh_gate_is_near_uniform_one_over_k(tiny_kwargs, K):
     """
-    NoiseGate's final conv is zero-initialised, so at construction the logits
-    are 0 and every gate weight is exactly 1/K — uniform routing, independent
-    of the input.  This is the documented "training starts from uniform
+    NoiseGate's final conv has a zero bias and a small-std weight, so at
+    construction every gate weight is within a fraction of a percent of 1/K —
+    effectively uniform routing, which is the "training starts from uniform
     routing" half of the stability contract.
+
+    It is deliberately not *exactly* uniform: an exactly zero head makes
+    d(logits)/d(hidden) zero and freezes the gate body. See
+    tests/test_model_components.py::test_noise_gate_is_trainable_end_to_end_at_init.
     """
     model = _moe(tiny_kwargs, num_experts=K)
-    assert torch.equal(model.gate.net[-1].weight,
-                       torch.zeros_like(model.gate.net[-1].weight))
-    assert torch.equal(model.gate.net[-1].bias,
-                       torch.zeros_like(model.gate.net[-1].bias))
+    assert float(model.gate.net[-1].bias.abs().max()) == 0.0
+    assert float(model.gate.net[-1].weight.std()) < 1e-2
 
     x, snr = _inputs(1, 16, 16, seed=9)
     model.train()
     _, _, gates = model(x, snr)
 
-    assert torch.allclose(gates, torch.full_like(gates, 1.0 / K), atol=1e-7), \
-        f"fresh gate is not uniform 1/{K}"
+    assert torch.allclose(gates, torch.full_like(gates, 1.0 / K), atol=1e-2), \
+        f"fresh gate is not near-uniform 1/{K}: {gates.min():.6f}..{gates.max():.6f}"
 
 
-def test_fresh_gate_ignores_the_snr_map(tiny_kwargs):
+def test_fresh_gate_responds_weakly_to_the_snr_map(tiny_kwargs):
     """
-    Corollary of the zero-init gate: two wildly different SNR maps give
-    bit-identical gates on a fresh model.  Sets up the contrast with
-    test_gate_is_conditioned_on_the_snr_map below.
+    The gate head is initialised small but non-zero, so on a fresh model two
+    wildly different SNR maps already produce *different* routing — just by a
+    tiny amount. That difference is what carries gradient into the gate body;
+    with the old exactly-zero head the two were bit-identical and the body was
+    frozen. Sets up the contrast with test_gate_is_conditioned_on_the_snr_map
+    below, which checks a trained-scale response.
     """
     model = _moe(tiny_kwargs, num_experts=3)
     x = packed_bayer(1, 16, 16, seed=10)
@@ -377,7 +392,10 @@ def test_fresh_gate_ignores_the_snr_map(tiny_kwargs):
         _, _, g_lo = model(x, snr_lo)
         _, _, g_hi = model(x, snr_hi)
 
-    assert torch.equal(g_lo, g_hi), "fresh (zero-init) gate is SNR dependent"
+    assert not torch.equal(g_lo, g_hi), \
+        "fresh gate is bit-identical across SNR — the head is zero-initialised again"
+    assert float((g_lo - g_hi).abs().max()) < 1e-2, \
+        "fresh gate routing swings too hard on SNR; init is not near-uniform"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -724,10 +742,10 @@ def test_gradient_from_blended_reaches_trunk_experts_and_gate(tiny_kwargs):
     (blocks and proj_out) and the gate — otherwise part of the network is dead
     weight during the MoE phase.
 
-    proj_out is woken up first and the experts are made to disagree: at the
-    literal zero-init the clamp floor kills all gradients (see the xfail below),
-    and identical experts give the gate zero gradient because sum_k gates_k is
-    constant.
+    proj_out is woken up first and the experts are made to disagree: identical
+    experts give the gate zero gradient because sum_k gates_k is constant. (At
+    the old literal zero-init the clamp floor killed all gradients outright —
+    see test_fresh_model_produces_nonzero_gradients.)
     """
     model = _wake_gate(_wake_experts(_moe(tiny_kwargs, num_experts=3)), scale=1.0)
     x, snr = _inputs(1, 16, 16, seed=19)
@@ -758,22 +776,18 @@ def test_gradient_from_blended_reaches_trunk_experts_and_gate(tiny_kwargs):
     assert gsum("gate.net.4") > 0.0, "gate output conv has no gradient"
 
 
-@pytest.mark.xfail(
-    reason="BUG: zero-init proj_out + clamp(min=_CLAMP_EPS) makes every "
-           "parameter gradient exactly 0 on a freshly built MoEDenoiser",
-    strict=False,
-)
 def test_fresh_model_produces_nonzero_gradients(tiny_kwargs):
     """
-    A freshly constructed model must be trainable: some parameter must receive a
-    non-zero gradient from a loss on `blended`.
+    A freshly constructed model must be trainable: EVERY parameter must receive
+    a non-zero gradient from a loss on `blended`.
 
-    It does not.  ExpertHead.proj_out is zero-initialised, so each expert's raw
-    output is exactly 0.0, which is BELOW _CLAMP_EPS; clamp(min=...) has zero
-    derivative there, so no gradient escapes the expert heads.  The gate is
-    equally dead: with all experts equal, d(sum_k g_k e_k)/d logits = 0 because
-    sum_k g_k == 1.  Result: every single parameter gradient is exactly zero,
-    the optimizer step is a no-op, and the model can never leave the init point.
+    This used to fail for every parameter in the model. ExpertHead.proj_out was
+    zero-initialised, so each expert's raw output was exactly 0.0 — below
+    _CLAMP_EPS, where clamp(min=...) has zero derivative — so no gradient
+    escaped the expert heads. The gate was equally dead: with all experts
+    equal, d(sum_k g_k e_k)/d logits = 0 because sum_k g_k == 1. Every gradient
+    was exactly zero, the optimizer step was a no-op, and the model could never
+    leave its init point at any learning rate.
     """
     model = _moe(tiny_kwargs, num_experts=3)
     x, snr = _inputs(1, 16, 16, seed=20)
@@ -781,12 +795,13 @@ def test_fresh_model_produces_nonzero_gradients(tiny_kwargs):
     blended, _, _ = model(x, snr)
     blended.mean().backward()
 
-    total = sum(float(p.grad.abs().sum()) for p in model.parameters()
-                if p.grad is not None)
-    assert total > 0.0, (
-        "every parameter gradient is exactly zero on a fresh MoEDenoiser: the "
-        "zero-init expert output sits below the _CLAMP_EPS floor, where "
-        "clamp() has zero derivative"
+    dead = [n for n, p in model.named_parameters()
+            if p.grad is None or float(p.grad.abs().sum()) == 0.0]
+    assert not dead, (
+        f"{len(dead)}/{sum(1 for _ in model.parameters())} parameters get exactly "
+        f"zero gradient on a fresh MoEDenoiser: {dead[:5]}. Check that "
+        "ExpertHead.proj_out is not zero-initialised — a zero init puts the "
+        "output on the _CLAMP_EPS floor, where clamp() has zero derivative."
     )
 
 

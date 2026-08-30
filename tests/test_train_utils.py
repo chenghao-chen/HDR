@@ -35,7 +35,7 @@ from helpers import (
     packed_bayer_3d,
 )
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(T.__file__)))
+REPO_ROOT = os.path.dirname(os.path.abspath(T.__file__))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,8 +130,12 @@ def test_import_does_not_start_training(tmp_path):
     assert info["run_is_none"] is True, "importing created a W&B run"
     # setdefault, not assignment
     assert info["wandb_dir"] == "/sentinel/wandb/dir"
-    assert info["wandb_cache"] == "/scratch/gilbreth/chen4848/wandb_cache"
-    assert info["wandb_data"] == "/scratch/gilbreth/chen4848/wandb_data"
+    # The defaults follow the machine (eagle on Polaris, flare on Aurora), not
+    # the original Gilbreth scratch paths, which exist on neither system.
+    from hdr_platform import resolve_project_root
+    wandb_root = resolve_project_root()
+    assert info["wandb_cache"] == os.path.join(wandb_root, "wandb_cache")
+    assert info["wandb_data"] == os.path.join(wandb_root, "wandb_data")
     # no run folder / log file created at import time
     assert info["cwd_after"] == info["cwd_before"], \
         f"import wrote to CWD: {info['cwd_after']} vs {info['cwd_before']}"
@@ -535,36 +539,48 @@ def test_collate_pad_preserves_bayer_phase_in_padded_region():
             f"{sorted(set(sub.unique().tolist()))}")
 
 
-def test_collate_pad_padded_region_is_a_reflection_of_real_content():
+def test_collate_pad_padded_region_replicates_the_edge():
     """
-    The padded values are not garbage/zeros: reflect mode mirrors the last
-    rows/cols. Zeros would look like black pixels to the SNR estimator and to
-    the encoder's receptive field near the border, so pin that the padding is
-    a genuine mirror of the interior.
+    The padded values are not garbage/zeros: replicate mode repeats the last
+    real row/column. Zeros would look like black pixels to the SNR estimator
+    and to the encoder's receptive field near the border, so pin that the
+    padding is a genuine continuation of the interior.
+
+    This was `mode="reflect"` until reflect turned out to reject any pad that
+    is not strictly smaller than the source dimension — see
+    test_collate_pad_handles_a_pad_larger_than_the_image.
     """
     x = packed_bayer_3d(17, 16, seed=3)
     out = T.collate_pad_to_max([{"x": x, "xm": x, "y": x.clone()}])
     padded = out["x"][0]
     assert padded.shape[1] == 24            # 17 -> 24
-    # rows 17..23 mirror rows 15, 14, ... (reflect excludes the edge row)
-    for k in range(1, 24 - 17 + 1):
-        assert torch.equal(padded[:, 16 + k, :16], x[:, 16 - k, :16]), \
-            f"row {16 + k} is not the reflection of row {16 - k}"
+    # rows 17..23 all repeat row 16, the last real one
+    for r in range(17, 24):
+        assert torch.equal(padded[:, r, :16], x[:, 16, :16]), \
+            f"row {r} is not a replication of the last real row"
 
 
-def test_collate_pad_reflect_fails_when_pad_exceeds_image_size():
+def test_collate_pad_handles_a_pad_larger_than_the_image():
     """
-    Documents a real limitation of `mode="reflect"`: PyTorch requires the pad
-    to be strictly smaller than the dimension, so a batch whose largest image
-    is more than ~2x the smallest raises RuntimeError instead of padding.
-    Latent today only because Phase 2 runs with batch_sz = 1 (max == the image
-    itself, so the pad is at most 7); it would fire immediately if anyone
-    raised the Phase 2 batch size on a dataset with mixed orientations.
+    A batch whose largest image is more than ~2x the smallest must still
+    collate. `mode="reflect"` could not do this — PyTorch requires a reflect
+    pad to be strictly smaller than the dimension, so this raised
+    "Padding size should be less than the corresponding input dimension"
+    instead of padding. It was latent only because Phase 2 runs at batch_sz=1
+    (max == the image itself, so the pad is at most 7); it fired the moment
+    anyone raised the Phase 2 batch size on a dataset with mixed orientations.
     """
     small = _sample(9, 9, seed=0)
     big = _sample(24, 24, seed=1)
-    with pytest.raises(RuntimeError, match="[Pp]adding size"):
-        T.collate_pad_to_max([small, big])
+    out = T.collate_pad_to_max([small, big])
+
+    assert_shape(out["x"], (2, 4, 24, 24), "padded x")
+    assert_shape(out["y"], (2, 4, 24, 24), "padded y")
+    assert torch.isfinite(out["x"]).all()
+    # The small image's real content survives in the top-left corner.
+    assert torch.equal(out["x"][0, :, :9, :9], small["x"])
+    assert torch.equal(out["orig_h"], torch.tensor([9, 24]))
+    assert torch.equal(out["orig_w"], torch.tensor([9, 24]))
 
 
 def test_collate_pad_batch_is_stackable_and_finite():

@@ -156,8 +156,15 @@ def collate_pad_to_max(batch):
     max_w = ((max(s["x"].shape[2] for s in batch) + 7) // 8) * 8
 
     def pad(t):
+        # Replicate, not reflect: reflect requires the pad to be strictly
+        # smaller than the source dimension, so a batch holding any image less
+        # than half the (ceil-8) max size raised
+        #   "Padding size should be less than the corresponding input dimension".
+        # Phase 2 batches full-resolution images of differing sizes, which is
+        # exactly where that happens. The padded region is excluded from the
+        # loss by valid_mask, so the fill only has to be finite and edge-stable.
         _, h, w = t.shape
-        return F.pad(t, (0, max_w - w, 0, max_h - h), mode="reflect")
+        return F.pad(t, (0, max_w - w, 0, max_h - h), mode="replicate")
 
     return {
         "x":      torch.stack([pad(s["x"]) for s in batch]),

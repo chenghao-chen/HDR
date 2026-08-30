@@ -30,6 +30,7 @@ from helpers import (
 )
 
 from HDR_model_hybrid_Teacher import (
+    _CLAMP_EPS,
     ExpertHead,
     HeavyExposhare,
     NoiseGate,
@@ -562,32 +563,39 @@ def test_noise_gate_shape_at_packed_bayer_resolution(num_experts):
 
 
 @pytest.mark.parametrize("num_experts", [1, 2, 3, 5])
-def test_noise_gate_is_exactly_uniform_at_initialisation(num_experts):
+def test_noise_gate_is_near_uniform_at_initialisation(num_experts):
     """
-    The final 1x1 conv is zero-initialised (weight AND bias), so at step 0
-    every logit is 0 and softmax gives EXACTLY 1/K at every pixel.
+    The final 1x1 conv has a zero bias and a small-std (1e-3) weight, so at
+    step 0 the logits are ~1e-3 and softmax is within a fraction of a percent
+    of 1/K at every pixel.
 
-    This is a documented training-stability property: the MoE starts as a
-    plain average of its experts, so no expert is starved before it has
-    learned anything. Asserting it exactly (not approximately) is the point —
-    a non-zero bias init would break it while still "looking uniform".
+    This is the training-stability property: the MoE starts as very nearly a
+    plain average of its experts, so no expert is starved before it has learned
+    anything. It used to be *exactly* uniform via a zero weight, but an exactly
+    zero head also makes d(logits)/d(hidden) exactly zero, which froze the
+    gate's two hidden convs — see
+    test_noise_gate_is_trainable_end_to_end_at_init. Near-uniform buys the same
+    stability and keeps the whole gate trainable from the first step.
     """
     gate = NoiseGate(num_experts)
-    assert float(gate.net[-1].weight.abs().max()) == 0.0
-    assert float(gate.net[-1].bias.abs().max()) == 0.0
+    assert float(gate.net[-1].bias.abs().max()) == 0.0, "gate head bias must start at zero"
+    assert float(gate.net[-1].weight.abs().max()) > 0.0, "gate head weight must not be zero"
+    assert float(gate.net[-1].weight.std()) < 1e-2, "gate head init is too large to be near-uniform"
 
     x = packed_bayer(batch=2, h=16, w=16, seed=37)
     snr = estimate_local_snr_map(x, window_size=5)
     out = gate(x, snr)
 
     expected = torch.full_like(out, 1.0 / num_experts)
-    assert torch.equal(out, expected), \
-        f"init routing not exactly uniform: {torch.unique(out)}"
+    assert torch.allclose(out, expected, atol=1e-2), \
+        f"init routing not near-uniform: {out.min():.6f}..{out.max():.6f}"
+    assert torch.allclose(out.sum(dim=1), torch.ones_like(out[:, 0])), \
+        "gates must sum to 1 across experts"
 
-    # Uniform for *any* input, including degenerate ones.
+    # Near-uniform for *any* input, including degenerate ones.
     flat = torch.full((1, 4, 16, 16), 0.5)
     out_flat = gate(flat, torch.zeros(1, 1, 16, 16))
-    assert torch.equal(out_flat, torch.full_like(out_flat, 1.0 / num_experts))
+    assert torch.allclose(out_flat, torch.full_like(out_flat, 1.0 / num_experts), atol=1e-2)
 
 
 @pytest.mark.parametrize("num_experts", [2, 3])
@@ -657,17 +665,16 @@ def test_noise_gate_reads_snr_as_the_final_input_channel():
         "gate ignored the SNR channel"
 
 
-def test_noise_gate_head_gradient_is_nonzero_at_init():
+def test_noise_gate_is_trainable_end_to_end_at_init():
     """
-    The zero-init head is dormant, not dead: at step 0 the *body* of the gate
-    receives exactly zero gradient (d logits / d hidden == net[-1].weight == 0),
-    but net[-1].weight and net[-1].bias do get non-zero gradients — so one
-    optimiser step is enough for the router to leave uniform routing and wake
-    the body up.
+    Every parameter of the gate — head *and* body — receives a non-zero
+    gradient at step 0.
 
-    Pinning both halves matters: an all-zero head gradient would freeze the
-    MoE as a permanent ensemble average, and a non-zero body gradient here
-    would mean the head was not actually zero-initialised.
+    This is the regression guard for the old zero-init head. With
+    net[-1].weight exactly zero, d(logits)/d(hidden) is exactly zero, so the
+    two hidden convs sat frozen while only the head moved; the body could not
+    start learning until the head had drifted off zero. A small-std head keeps
+    routing effectively uniform and the whole gate live from the first step.
     """
     gate = NoiseGate(3)
     x = packed_bayer(batch=2, h=16, w=16, seed=47)
@@ -678,14 +685,12 @@ def test_noise_gate_head_gradient_is_nonzero_at_init():
     F.mse_loss(gate(x, snr), target).backward()
 
     head = gate.net[-1]
-    assert float(head.weight.grad.abs().sum()) > 0.0, "zero-init head cannot learn"
-    assert float(head.bias.grad.abs().sum()) > 0.0, "zero-init head bias cannot learn"
+    assert float(head.weight.grad.abs().sum()) > 0.0, "gate head weight cannot learn"
+    assert float(head.bias.grad.abs().sum()) > 0.0, "gate head bias cannot learn"
 
     for name, p in gate.named_parameters():
-        if name.startswith("net.4."):         # the head itself
-            continue
-        assert float(p.grad.abs().sum()) == 0.0, \
-            f"{name} got a gradient through a zero-initialised head"
+        assert p.grad is not None and float(p.grad.abs().sum()) > 0.0, \
+            f"{name} receives no gradient — the gate body is frozen at init"
 
 
 def test_noise_gate_gradients_reach_every_parameter_once_head_is_nonzero():
@@ -762,22 +767,32 @@ def test_expert_head_r_is_in_dim_over_four(in_dim, expected_r):
     assert head.blocks[0].conv1.in_channels == in_dim
 
 
-def test_expert_head_outputs_exactly_zero_at_initialisation():
+def test_expert_head_output_is_nonzero_at_initialisation():
     """
-    proj_out is zero-initialised (weight AND bias), so a freshly built head
-    returns EXACTLY 0 for any input.
+    proj_out uses the default Conv2d init, so a freshly built head produces a
+    non-zero, input-dependent output.
 
-    Combined with the uniform gate this means the MoE's initial prediction is
-    exactly zero rather than noise — the documented warm-start. Note the raw
-    head output is 0; MoEDenoiser is what clamps it up to _CLAMP_EPS.
+    This is the regression guard for the bug that made the whole model
+    untrainable. proj_out used to be zero-initialised so the head returned
+    EXACTLY 0.0; MoEDenoiser then clamps to min=_CLAMP_EPS, and clamp's
+    backward is zero below the floor, so every output element sat on the floor
+    and *no* parameter in the model received any gradient — not even proj_out
+    itself, so it could never bootstrap out. See
+    tests/test_model_moe.py::test_fresh_model_produces_nonzero_gradients.
     """
     head = ExpertHead(16, out_channels=3, num_blocks=2, se_reduction=8)
-    assert float(head.proj_out.weight.abs().max()) == 0.0
-    assert float(head.proj_out.bias.abs().max()) == 0.0
+    assert float(head.proj_out.weight.abs().max()) > 0.0, \
+        "proj_out is zero-initialised again — this kills every gradient in the model"
 
     for feat in (torch.randn(2, 16, 4, 4), torch.randn(2, 16, 4, 4) * 100.0):
         out = head(feat)
-        assert float(out.abs().max()) == 0.0, "fresh expert head is not exactly zero"
+        assert torch.isfinite(out).all(), "fresh expert head produced non-finite output"
+        assert float(out.abs().max()) > 0.0, "fresh expert head is identically zero"
+
+    # And the output must clear the clamp floor, or the gradient dies there.
+    out = head(torch.randn(4, 16, 8, 8))
+    assert float(out.abs().median()) > _CLAMP_EPS, \
+        "fresh expert output sits at/below the clamp floor; gradients will be killed"
 
 
 def test_expert_head_pixelshuffle_places_channels_at_the_right_subpixels():
@@ -789,8 +804,12 @@ def test_expert_head_pixelshuffle_places_channels_at_the_right_subpixels():
     """
     head = ExpertHead(16, out_channels=3, num_blocks=1, se_reduction=8)
     with torch.no_grad():
+        # Zero the weight explicitly so the output is the bias alone. proj_out
+        # is no longer zero-initialised (that made the model untrainable), so
+        # this test has to establish the condition it needs for itself.
+        head.proj_out.weight.zero_()
         head.proj_out.bias.copy_(torch.arange(12, dtype=torch.float32))
-    out = head(torch.randn(1, 16, 2, 2))     # weight is still zero -> bias only
+    out = head(torch.randn(1, 16, 2, 2))     # weight zeroed above -> bias only
     assert_shape(out, (1, 3, 8, 8), "expert_out")
 
     for colour in range(3):

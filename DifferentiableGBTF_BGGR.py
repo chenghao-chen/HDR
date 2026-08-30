@@ -2,6 +2,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def _shift_replicate(t, shift, dim):
+    """
+    Shift ``t`` along ``dim`` by ``shift``, holding the edge value instead of
+    wrapping around — the edge-clamped equivalent of ``torch.roll``.
+
+    ``shift=2`` moves content towards higher indices, so the result at index i
+    is ``t[i - 2]``, clamped to ``t[0]`` for i < 2. This is the shift GBTF's
+    direction weights need: a circular roll gives pixels on one border weights
+    computed from the other border, tens or thousands of pixels away.
+    """
+    n = t.shape[dim]
+    if dim == 2:                       # vertical: pad (left, right, top, bottom)
+        pad = (0, 0, shift, 0) if shift > 0 else (0, 0, 0, -shift)
+    elif dim == 3:                     # horizontal
+        pad = (shift, 0, 0, 0) if shift > 0 else (0, -shift, 0, 0)
+    else:
+        raise ValueError(f"_shift_replicate expects dim 2 or 3, got {dim}")
+
+    padded = F.pad(t, pad, mode="replicate")
+    start = 0 if shift > 0 else -shift
+    return padded.narrow(dim, start, n)
+
+
 class DifferentiableGBTF_BGGR(nn.Module):
     """
     A fully differentiable PyTorch implementation of the GBTF Demosaicing Algorithm.
@@ -18,15 +42,21 @@ class DifferentiableGBTF_BGGR(nn.Module):
         # 2. Box filter 5x5 for Sum Sliding Windows
         self.register_buffer('box5x5', torch.ones(1, 1, 5, 5, dtype=torch.float32))
 
-        # 3. Prb Matrix 7x7 for opposing color interpolation
+        # 3. Prb Matrix 7x7 for opposing color interpolation.
+        # The taps are exact 32nds: 10/32 = 0.3125 and -1/32 = -0.03125, so the
+        # 4 positive and 8 negative taps sum to 4*(10/32) - 8*(1/32) = 1 exactly.
+        # A unit DC gain is what makes RB = G - Prb*(G-C) reproduce a flat
+        # colour exactly. The old value -0.0313 was 1/32 rounded to 4 decimals,
+        # leaving the gain at 0.9996 and giving R/B a systematic ~4e-4 bias.
+        _p, _n = 10.0 / 32.0, -1.0 / 32.0
         prb = torch.tensor([
-            [ 0, 0, -0.0313, 0, -0.0313, 0, 0],
-            [ 0, 0, 0, 0, 0, 0, 0],
-            [-0.0313, 0, 0.3125, 0, 0.3125, 0, -0.0313],
-            [ 0, 0, 0, 0, 0, 0, 0],
-            [-0.0313, 0, 0.3125, 0, 0.3125, 0, -0.0313],
-            [ 0, 0, 0, 0, 0, 0, 0],
-            [ 0, 0, -0.0313, 0, -0.0313, 0, 0]
+            [  0, 0, _n, 0, _n, 0,  0],
+            [  0, 0,  0, 0,  0, 0,  0],
+            [ _n, 0, _p, 0, _p, 0, _n],
+            [  0, 0,  0, 0,  0, 0,  0],
+            [ _n, 0, _p, 0, _p, 0, _n],
+            [  0, 0,  0, 0,  0, 0,  0],
+            [  0, 0, _n, 0, _n, 0,  0]
         ], dtype=torch.float32)
         self.register_buffer('Prb', prb.view(1, 1, 7, 7))
 
@@ -76,11 +106,16 @@ class DifferentiableGBTF_BGGR(nn.Module):
         V_sum = F.conv2d(pad_box_v, self.box5x5)
 
         eps = 1e-9
-        # PyTorch roll identically mimics Numpy's vstack/hstack array shifting
-        N_val = torch.roll(V_sum, shifts=2, dims=2)
-        S_val = torch.roll(V_sum, shifts=-2, dims=2)
-        E_val = torch.roll(H_sum, shifts=2, dims=3)
-        W_val = torch.roll(H_sum, shifts=-2, dims=3)
+        # Edge-clamped shifts, NOT torch.roll. roll is circular, so it made
+        # E_val[..., 0] == H_sum[..., -2]: every border pixel was interpolated
+        # with direction weights taken from the OPPOSITE border. That corrupts
+        # the border of every demosaiced GT frame and means patch-wise
+        # inference can never agree with full-frame inference. Replicating the
+        # edge keeps the operator local, which is what GBTF assumes.
+        N_val = _shift_replicate(V_sum, 2, dim=2)
+        S_val = _shift_replicate(V_sum, -2, dim=2)
+        E_val = _shift_replicate(H_sum, 2, dim=3)
+        W_val = _shift_replicate(H_sum, -2, dim=3)
 
         # BUG FIX: Renamed N, S, E, W to Wt_N, Wt_S, Wt_E, Wt_W so 'W' (Width) is preserved!
         Wt_N = 1.0 / (N_val**2 + eps)
