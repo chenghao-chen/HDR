@@ -21,5 +21,8 @@ wandb/
 # Per-frame test figures (regenerate with scripts/save_test_outputs.py)
 test_visuals/
 
+# Generated sweep report (regenerate with scripts/build_sweep_report.py)
+report/
+
 # Core dumps
 core.*
