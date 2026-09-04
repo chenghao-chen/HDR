@@ -326,7 +326,18 @@ if __name__ == "__main__":
     # Shared loss weights
     mu             = 5000   # µ-law tonemapping constant (HDR literature standard)
     aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
-    balance_weight = 0.01 if MODE == "moe" else 0.0   # anti expert-collapse
+    # Anti expert-collapse, but weak: at 0.01 this term dominated the gate's
+    # training signal and pinned routing near-uniform (measured on the first
+    # trained checkpoint: gate weights spanned [0.492, 0.508] everywhere,
+    # essentially independent of the per-pixel SNR map the gate is
+    # conditioned on, and the two experts converged to functions differing
+    # by ~4%). load_balance = K*(mean_gate)^2 - 1 pushes toward EXACTLY
+    # uniform usage, which fights specialisation directly rather than only
+    # guarding against total collapse onto one expert. 0.001 keeps that
+    # guard without dominating; see MoEDenoiser's _EXPERT_INIT_SPREAD for
+    # the other half of this fix (breaking the experts' init symmetry, so
+    # there is something for the gate to route toward in the first place).
+    balance_weight = 0.001 if MODE == "moe" else 0.0   # anti expert-collapse
 
     start_epoch = 0
     best_psnr_mu = 0.0
