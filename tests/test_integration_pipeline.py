@@ -205,16 +205,18 @@ def _composite_loss(model, x, snr_map, y_rgb, valid_mask, orig_h, orig_w,
     return total, comps, (y_pred, expert_outs, gates)
 
 
-def _break_the_zero_init(model, seed=3):
+def _diversify_output_layers(model, seed=3):
     """
-    Give every zero-initialised output layer a small non-zero value.
+    Spread the output layers apart so the experts genuinely disagree.
 
-    ExpertHead.proj_out and NoiseGate.net[-1] are zero-initialised on
-    purpose, which makes every expert output exactly 0 at step 0. Several
-    tests need a model whose predictions are non-degenerate (a checkpoint
-    round trip against an all-eps output would be vacuous, and a gradient
-    can only be observed where the graph is alive). This does not touch any
-    source module — it perturbs an instantiated model in place.
+    A fresh model starts deliberately near-uniform: every ExpertHead.proj_out
+    sits around _INIT_OUT_LEVEL and NoiseGate.net[-1] is small, so all experts
+    predict nearly the same dim field and routing is nearly 1/K. Several tests
+    need predictions that are non-degenerate and experts that differ — a
+    checkpoint round trip against near-identical outputs would be close to
+    vacuous, and gate gradients only show up when the experts disagree. This
+    does not touch any source module — it perturbs an instantiated model in
+    place.
     """
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
@@ -325,22 +327,19 @@ def test_phase1_training_step_end_to_end(tmp_path, tiny_kwargs):
     assert not bad, f"parameters became NaN/Inf after optimizer.step(): {bad}"
 
 
-@pytest.mark.xfail(reason="BUG: zero-init proj_out + clamp(min=_CLAMP_EPS) "
-                          "gives every parameter exactly zero gradient",
-                   strict=False)
 def test_phase1_training_step_delivers_nonzero_gradient(tiny_kwargs):
     """
     A freshly built MoE model must be trainable: at least the expert heads
     and the shared trunk have to receive a NON-ZERO gradient from the
     composite loss on step 0.
 
-    Why it matters: ExpertHead.proj_out is zero-initialised, so every expert
-    output is exactly 0.0 before clamping. MoEDenoiser.forward then applies
-    .clamp(min=_CLAMP_EPS); clamp's derivative is 0 below the bound, so the
-    whole trunk+expert subgraph is cut off. With zero gradients Adam takes a
-    zero-sized step, proj_out stays zero, and the model never leaves its
-    initialisation. Non-None-but-zero gradients look healthy to every
-    smoke test, which is exactly why this needs pinning.
+    Why it matters: ExpertHead.proj_out used to be zero-initialised, so every
+    expert output was exactly 0.0 before clamping. MoEDenoiser.forward then
+    applies .clamp(min=_CLAMP_EPS); clamp's derivative is 0 below the bound, so
+    the whole trunk+expert subgraph was cut off. With zero gradients Adam took a
+    zero-sized step, proj_out stayed zero, and the model never left its
+    initialisation at any learning rate. Non-None-but-zero gradients look
+    healthy to every smoke test, which is exactly why this needs pinning.
     """
     model, x, snr, y_rgb, mask, oh, ow, K = _tiny_batch(tiny_kwargs)
     percep, _ = _perceptual_loss()
@@ -358,18 +357,15 @@ def test_phase1_training_step_delivers_nonzero_gradient(tiny_kwargs):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(reason="BUG: dead gradient at init (see "
-                          "test_phase1_training_step_delivers_nonzero_gradient) "
-                          "freezes the loss for every step",
-                   strict=False)
 def test_phase1_overfits_one_batch_from_default_init(tiny_kwargs):
     """
     Five Phase-1 steps on a single fixed batch must reduce the loss: a model
     with ~100K parameters can trivially overfit two 16x16 patches, so a flat
     or rising curve means the optimisation is not connected to the objective.
 
-    This is the end-to-end consequence of the dead-gradient defect: from the
-    shipped initialisation the loss does not move at all.
+    This is the end-to-end regression guard for the dead-gradient defect: with
+    the old zero-init proj_out the loss did not move at all from the shipped
+    initialisation.
     """
     model, x, snr, y_rgb, mask, oh, ow, K = _tiny_batch(tiny_kwargs)
     percep, _ = _perceptual_loss()
@@ -402,7 +398,7 @@ def test_phase1_overfits_one_batch_with_live_gradients(tiny_kwargs):
     to the init/clamp interaction rather than to this test's loss.
     """
     model, x, snr, y_rgb, mask, oh, ow, K = _tiny_batch(tiny_kwargs)
-    _break_the_zero_init(model)
+    _diversify_output_layers(model)
     percep, _ = _perceptual_loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -640,7 +636,7 @@ def test_phase2_valid_mask_makes_the_loss_ignore_padded_pixels(tiny_kwargs):
         "valid_mask must cover exactly 2*orig_h x 2*orig_w sensor pixels"
 
     model = build_denoiser("moe", num_experts=2, **tiny_kwargs)
-    _break_the_zero_init(model)
+    _diversify_output_layers(model)
     model.train()
     K = model.num_experts
     percep, _ = _perceptual_loss()
@@ -756,7 +752,7 @@ def test_checkpoint_round_trip_two_experts(tmp_path, tiny_kwargs, device):
     comparison would pass for any architecture at all.
     """
     model = build_denoiser("moe", num_experts=2, **tiny_kwargs)
-    _break_the_zero_init(model, seed=41)
+    _diversify_output_layers(model, seed=41)
     ckpt = _train_style_checkpoint(tmp_path / "p1.pth", model, "moe", 2,
                                    dict(tiny_kwargs))
 
@@ -773,16 +769,13 @@ def test_checkpoint_round_trip_two_experts(tmp_path, tiny_kwargs, device):
 
     # And the comparison is not vacuous: a different init disagrees.
     other = build_denoiser("moe", num_experts=2, **tiny_kwargs)
-    _break_the_zero_init(other, seed=999)
+    _diversify_output_layers(other, seed=999)
     other.eval()
     with torch.no_grad():
         assert not torch.equal(other(x, snr)[0], loaded(x, snr)[0]), \
             "two different inits produced identical output — test is vacuous"
 
 
-@pytest.mark.xfail(reason="BUG: load_model_from_checkpoint hardcodes "
-                          "num_experts=2, ignoring the checkpoint's value",
-                   strict=False)
 def test_checkpoint_round_trip_three_experts(tmp_path, tiny_kwargs, device):
     """
     The same round trip with num_experts=3. The checkpoint records
@@ -798,7 +791,7 @@ def test_checkpoint_round_trip_three_experts(tmp_path, tiny_kwargs, device):
     build_denoiser signature defaults to num_experts=3.
     """
     model = build_denoiser("moe", num_experts=3, **tiny_kwargs)
-    _break_the_zero_init(model, seed=42)
+    _diversify_output_layers(model, seed=42)
     ckpt = _train_style_checkpoint(tmp_path / "p1_k3.pth", model, "moe", 3,
                                    dict(tiny_kwargs))
 
@@ -821,7 +814,7 @@ def test_checkpoint_loader_strips_the_torch_compile_prefix(tmp_path,
     unreadable by the benchmark script.
     """
     model = build_denoiser("moe", num_experts=2, **tiny_kwargs)
-    _break_the_zero_init(model, seed=43)
+    _diversify_output_layers(model, seed=43)
     ckpt = _train_style_checkpoint(tmp_path / "compiled.pth", model, "moe", 2,
                                    dict(tiny_kwargs), prefix="_orig_mod.")
 

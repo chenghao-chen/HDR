@@ -84,8 +84,7 @@ def load_model_from_checkpoint(checkpoint_path, fallback_kwargs, device,
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     mode         = ckpt.get("mode", "dual")
     model_kwargs = ckpt.get("model_kwargs", fallback_kwargs)
-    # num_experts  = ckpt.get("num_experts", fallback_num_experts)
-    num_experts  = 2 #ckpt.get("num_experts", fallback_num_experts)
+    num_experts  = ckpt.get("num_experts", fallback_num_experts)
     print(f"  Checkpoint mode: '{mode}'  num_experts={num_experts}")
     print(f"  Model kwargs:    {model_kwargs}")
 
@@ -192,9 +191,18 @@ def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
     _, _, H, W = noisy_bayer.shape    # Bayer resolution
     stride = patch_size - overlap
 
-    pad_h = (math.ceil((H - overlap) / stride) * stride + overlap) - H
-    pad_w = (math.ceil((W - overlap) / stride) * stride + overlap) - W
-    x_pad = F.pad(noisy_bayer, (0, pad_w, 0, pad_h), mode='reflect')
+    # Pad up to a whole number of strides, but never below patch_size: for
+    # H <= overlap the stride arithmetic yields Hp < patch_size, the tile loop
+    # `range(0, Hp - patch_size + 1, stride)` is empty, no tile ever runs and
+    # every pixel comes out 0/1e-8 = 0 — a correctly shaped, entirely black
+    # prediction that the benchmark would happily report a PSNR for.
+    pad_h = max(math.ceil((H - overlap) / stride) * stride + overlap, patch_size) - H
+    pad_w = max(math.ceil((W - overlap) / stride) * stride + overlap, patch_size) - W
+    # Replicate, not reflect: reflect requires the pad to be strictly smaller
+    # than the source dimension, so any image at most half the patch size
+    # (with PATCH_SIZE=1024, anything under ~512 packed pixels) raised while
+    # infer_full handled it fine.
+    x_pad = F.pad(noisy_bayer, (0, pad_w, 0, pad_h), mode='replicate')
     _, _, Hp, Wp = x_pad.shape
 
     # Output arrays at sensor resolution (2× Bayer)
@@ -224,8 +232,17 @@ def infer_patches(model, noisy_bayer, num_experts, patch_size=256, overlap=32,
             gate_sum  [:, :,    ys:ys+out_patch, xs:xs+out_patch] += gates.float() * win[:, 0]
             weight_sum[:, :,    ys:ys+out_patch, xs:xs+out_patch] += win
 
-    denom  = weight_sum + 1e-8                    # [1, 1, Hs, Ws]
+    # Every output pixel must have been covered by at least one tile. Without
+    # this, an empty or short tile loop yields 0/1e-8 = 0 and the benchmark
+    # reports a PSNR for a silently all-black prediction.
     H_out, W_out = H * 2, W * 2                  # crop to original sensor size
+    if float(weight_sum[..., :H_out, :W_out].min()) <= 0.0:
+        raise RuntimeError(
+            f"infer_patches left part of the image uncovered "
+            f"(H={H}, W={W}, patch_size={patch_size}, overlap={overlap}); "
+            "refusing to return a partly-zero prediction")
+
+    denom  = weight_sum + 1e-8                    # [1, 1, Hs, Ws]
     return (
         pred_sum  [...,    :H_out, :W_out] / denom[...,            :H_out, :W_out],
         expert_sum[..., :, :H_out, :W_out] / denom.unsqueeze(1)[..., :H_out, :W_out],
@@ -319,7 +336,13 @@ if __name__ == "__main__":
     CHECKPOINT     = os.environ.get(
         "HDR_CHECKPOINT",
         "models_p1_moe_Teacher_MobileHDR_20260619_0059/phase1_best.pth")
-    OUTPUT_DIR     = f"test_results/{CHECKPOINT.split('/')[0]}"
+    # basename(dirname(...)), not split('/')[0]: HDR_CHECKPOINT is naturally
+    # given as an absolute path, and split('/')[0] is then the empty string —
+    # every absolute-path run would write its log.txt, results.csv and rgb/*.jpg
+    # over the previous one.
+    OUTPUT_DIR     = os.path.join(
+        "test_results",
+        os.path.basename(os.path.dirname(os.path.abspath(CHECKPOINT))))
     INFERENCE      = "full"          # "full" | "patches"
     PATCH_SIZE     = 1024
     PATCH_OVERLAP  = PATCH_SIZE // 4

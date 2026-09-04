@@ -64,10 +64,10 @@ def _randomize(model, scale=0.05, seed=0):
     """
     Give every parameter a small non-zero value.
 
-    Freshly built ExpertHead/NoiseGate zero-initialise their last conv, so an
-    untouched MoEDenoiser emits the constant _CLAMP_EPS everywhere — which
-    would make every "the reloaded model reproduces the original" assertion
-    vacuously true. Randomising first makes those comparisons meaningful.
+    A freshly built MoEDenoiser starts near a dim constant (ExpertHead.proj_out
+    is initialised around _INIT_OUT_LEVEL with a small-variance weight), so
+    "the reloaded model reproduces the original" would be close to vacuous on
+    an untouched model. Randomising first makes those comparisons meaningful.
     """
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
@@ -197,7 +197,11 @@ def _output_dir_expr():
 
 
 def _eval_output_dir(checkpoint):
-    return eval(_output_dir_expr(), {"CHECKPOINT": checkpoint})
+    # `os` is in scope: the expression derives the run directory with
+    # os.path.basename/dirname rather than splitting the string, so that an
+    # absolute HDR_CHECKPOINT does not collapse to a shared 'test_results/'.
+    import os
+    return eval(_output_dir_expr(), {"CHECKPOINT": checkpoint, "os": os})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -388,10 +392,6 @@ def test_load_strips_torch_compile_orig_mod_prefix(tmp_path, tiny_kwargs, device
         assert torch.equal(loaded.state_dict()[k], v), f"{k} not restored"
 
 
-@pytest.mark.xfail(reason="BUG: num_experts is hardcoded to 2 in "
-                          "load_model_from_checkpoint; the checkpoint's stored "
-                          "num_experts is ignored and strict load fails",
-                   strict=False)
 def test_load_rebuilds_stored_num_experts_three(tmp_path, tiny_kwargs, device):
     """
     CRITICAL contract: the docstring promises the architecture is rebuilt from
@@ -416,10 +416,6 @@ def test_load_rebuilds_stored_num_experts_three(tmp_path, tiny_kwargs, device):
         assert torch.equal(original(x, snr)[0], loaded(x, snr)[0])
 
 
-@pytest.mark.xfail(reason="BUG: fallback_num_experts is dead — num_experts is "
-                          "hardcoded to 2, so legacy moe checkpoints cannot be "
-                          "loaded with a different expert count",
-                   strict=False)
 def test_fallback_num_experts_argument_is_used(tmp_path, tiny_kwargs, device):
     """
     Second half of the same defect: for a checkpoint with no stored
@@ -757,10 +753,6 @@ def test_infer_patches_asks_for_the_devices_own_autocast_backend(
     assert seen == [kind] * 9, f"expected 9 {kind} requests, got {seen}"
 
 
-@pytest.mark.xfail(reason="BUG: infer_patches reflect-pads by pad_h >= H when "
-                          "the image is at most half the patch size, which "
-                          "F.pad rejects",
-                   strict=False)
 def test_infer_patches_handles_image_smaller_than_the_patch():
     """
     A 16x16 packed image with patch_size=32 needs pad_h = 16 == H, and reflect
@@ -781,9 +773,6 @@ def test_infer_patches_handles_image_smaller_than_the_patch():
     assert torch.allclose(blended, torch.ones_like(blended), atol=1e-6)
 
 
-@pytest.mark.xfail(reason="BUG: when H <= overlap the tile loop body never "
-                          "runs and infer_patches silently returns all zeros",
-                   strict=False)
 def test_infer_patches_never_returns_a_silently_empty_prediction():
     """
     For H <= overlap, ceil((H-overlap)/stride) == 0, so Hp < patch_size and
@@ -922,9 +911,6 @@ def test_output_dir_uses_the_run_directory_of_a_relative_checkpoint():
     assert got == "test_results/models_p1_moe_Teacher_MobileHDR_20260619_0059"
 
 
-@pytest.mark.xfail(reason="BUG: OUTPUT_DIR uses CHECKPOINT.split('/')[0], so an "
-                          "absolute checkpoint path collapses to 'test_results/'",
-                   strict=False)
 def test_output_dir_survives_an_absolute_checkpoint_path():
     """
     CHECKPOINT is overridable via $HDR_CHECKPOINT, where an absolute path is

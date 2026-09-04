@@ -308,15 +308,7 @@ def test_cross_mode_downstream_consumer(mode, tiny_kwargs):
         f"{mode}: non-finite gradient from the unified loss"
 
 
-@pytest.mark.parametrize("mode", [
-    pytest.param("moe", marks=pytest.mark.xfail(
-        reason="BUG: MoE is dead at init — ExpertHead.proj_out is zero-init so the "
-               "raw head output is exactly 0.0, and clamp(min=_CLAMP_EPS) has zero "
-               "gradient below the floor, so trunk+experts get identically zero grad",
-        strict=False)),
-    "dual",
-    "single",
-])
+@pytest.mark.parametrize("mode", ["moe", "dual", "single"])
 def test_gradients_actually_reach_the_model_in_every_mode(mode, tiny_kwargs):
     """
     A freshly built model must be trainable: the unified gate-weighted loss has
@@ -325,16 +317,17 @@ def test_gradients_actually_reach_the_model_in_every_mode(mode, tiny_kwargs):
     initialisation can never learn anything — Adam on an all-zero gradient is a
     no-op, the weights never move, and the gradient stays zero forever.
 
-    This holds for dual/single.  It fails for moe: ExpertHead.proj_out is
-    zero-initialised (HDR_model_hybrid_Teacher.py:335-336) so every head emits
-    exactly 0.0, and MoEDenoiser.forward clamps that with
-    `.clamp(min=_CLAMP_EPS)` (line 439).  clamp's gradient below the floor is
-    0, so `expert_outs` — and therefore `blended` — is a *constant* with
-    respect to every trunk and expert parameter.  Nor does the gate escape:
-    with zero-init gate logits the softmax is exactly uniform and all experts
-    are identical, so dL/dlogits is a constant vector, which the softmax
-    Jacobian maps to exactly zero.  Measured: 30 Adam steps move 0 of 113
-    parameters and the output stays pinned at _CLAMP_EPS.
+    It used to hold for dual/single but fail for moe: ExpertHead.proj_out was
+    zero-initialised so every head emitted exactly 0.0, and MoEDenoiser.forward
+    clamps that with `.clamp(min=_CLAMP_EPS)`. clamp's gradient below the floor
+    is 0, so `expert_outs` — and therefore `blended` — was a *constant* with
+    respect to every trunk and expert parameter. Nor did the gate escape: with
+    zero-init gate logits the softmax is exactly uniform and all experts are
+    identical, so dL/dlogits is a constant vector, which the softmax Jacobian
+    maps to exactly zero. Measured at the time: 30 Adam steps moved 0 of 113
+    parameters and the output stayed pinned at _CLAMP_EPS. proj_out now starts
+    around a dim positive constant and the gate head small-but-non-zero, so
+    every mode is trainable from step 0.
     """
     model = build_denoiser(mode, num_experts=2, **tiny_kwargs)
     model.train()
