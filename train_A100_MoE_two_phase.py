@@ -266,8 +266,9 @@ if __name__ == "__main__":
     # per GPU on a node — without editing this file per run. Plain literals
     # still work for the single-run case; os.environ.get falls through to
     # them when the variable is unset.
-    MODE        = os.environ.get("HDR_MODE", "moe")            # "moe" | "dual" | "single"
+    MODE        = os.environ.get("HDR_MODE", "moe")            # "moe" | "dual" | "single" | "film"
     NUM_EXPERTS = int(os.environ.get("HDR_NUM_EXPERTS", "2"))  # MoE only
+    FILM_HIDDEN = int(os.environ.get("HDR_FILM_HIDDEN", "16")) # film only
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
                            # stable torch+inductor on the cluster)
 
@@ -362,6 +363,13 @@ if __name__ == "__main__":
         "heads":                [1, 2, 4, 8],
         "se_reduction":         8,
     }
+    if MODE == "film":
+        # Stored in model_kwargs (not passed alongside it) so it round-trips
+        # through the checkpoint: load_model_from_checkpoint rebuilds the
+        # architecture from the saved model_kwargs alone, and build_denoiser
+        # consumes film_hidden as a named parameter regardless of mode, so
+        # this is a safe no-op for every other mode.
+        model_kwargs["film_hidden"] = FILM_HIDDEN
 
     # ── W&B ───────────────────────────────────────────────────────────
     wandb.init(
