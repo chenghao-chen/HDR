@@ -48,12 +48,20 @@ sys.path.insert(0, REPO_ROOT)
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Build a LaTeX report comparing a num-experts sweep.",
+        description="Build a LaTeX report comparing a num-experts sweep, "
+                    "and optionally a FiLM sweep against it.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--tag", required=True,
-                   help="HDR_SWEEP_TAG the sweep was submitted with, e.g. "
-                        "'colorfix'. Matches models_p1_moe_K{K}_<tag>_polaris/.")
+                   help="HDR_SWEEP_TAG the num-experts sweep was submitted "
+                        "with, e.g. 'colorfix'. Matches "
+                        "models_p1_moe_K{K}_<tag>_polaris/.")
     p.add_argument("--experts", type=int, nargs="+", default=[1, 2, 3, 4])
+    p.add_argument("--film-tag", default=None,
+                   help="HDR_SWEEP_TAG the FiLM sweep was submitted with. "
+                        "Matches models_p1_film_H{H}_<film-tag>_polaris/. "
+                        "Default: same as --tag. Pass --film-widths '' "
+                        "(empty) to omit the FiLM section entirely.")
+    p.add_argument("--film-widths", type=int, nargs="*", default=[8, 16, 32, 64])
     p.add_argument("--frame", type=int, default=21,
                    help="Test-frame index to embed side by side across K "
                         "(same scene -> a fair visual comparison).")
@@ -138,6 +146,209 @@ class SweepMember:
         self.panel = os.path.join(self.visuals_dir, f"frame_{frame_idx:04d}_panel.jpg")
         if not os.path.isfile(self.panel):
             self.panel = None
+
+
+class FilmMember:
+    """
+    Everything gathered about one film_hidden value in the FiLM sweep.
+    Deliberately a separate class from SweepMember rather than a shared base:
+    the two sweeps' directory-naming schemes and axis (K vs film_hidden)
+    differ enough that a shared base would mostly be indirection, and
+    SweepMember is already exercised by the num-experts report path, so
+    leaving it untouched avoids risking that.
+    """
+
+    def __init__(self, h, tag):
+        self.h = h
+        self.checkpoint = f"models_p1_film_H{h}_{tag}_polaris/phase1_best.pth"
+        self.bench_log = f"test_results/models_p1_film_H{h}_{tag}_polaris/log.txt"
+        self.visuals_dir = f"test_visuals/models_p1_film_H{h}_{tag}_polaris"
+        self.results_csv = os.path.join(self.visuals_dir, "results.csv")
+        self.panel = None
+
+        self.present = os.path.isfile(self.checkpoint)
+        self.params_m = None
+        self.epoch = None
+        self.gflops = None
+        self.agg = {}
+
+    def load(self, frame_idx):
+        if not self.present:
+            return
+        payload = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
+        state = payload.get("model_state_dict", payload)
+        self.params_m = sum(t.numel() for t in state.values()
+                            if hasattr(t, "numel")) / 1e6
+        self.epoch = payload.get("epoch")
+
+        if os.path.isfile(self.bench_log):
+            text = open(self.bench_log).read()
+            m = re.search(r"GFLOPs\s*/\s*patch:\s*([\d.]+)", text)
+            if m:
+                self.gflops = float(m.group(1))
+
+        if os.path.isfile(self.results_csv):
+            rows = list(csv.DictReader(open(self.results_csv)))
+            if rows:
+                numeric_cols = [c for c in rows[0] if c != "frame"]
+                for c in numeric_cols:
+                    vals = [float(r[c]) for r in rows if r.get(c) not in (None, "")]
+                    if vals:
+                        self.agg[c] = sum(vals) / len(vals)
+
+        p = os.path.join(self.visuals_dir, f"frame_{frame_idx:04d}_panel.jpg")
+        self.panel = p if os.path.isfile(p) else None
+
+
+def build_film_table(members):
+    present = [m for m in members if m.present]
+    if not present:
+        return "No FiLM sweep checkpoints were found.\n"
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{FiLM sweep, held-out Mobile-HDR test split "
+        r"(full resolution, 28 frames unless noted).}",
+        r"\label{tab:film}",
+        r"\small",
+        r"\resizebox{\textwidth}{!}{%",
+        r"\begin{tabular}{r r r r r r r r}",
+        r"\toprule",
+        r"film\_hidden & Params (M) & GFLOPs/patch & PSNR-$\mu$ (dB) & SSIM & "
+        r"Gain (dB) & Chroma (\%) & $s$/frame \\",
+        r"\midrule",
+    ]
+    for m in present:
+        gflops = f"{m.gflops:.2f}" if m.gflops is not None else "--"
+        psnr = f"{m.agg.get('psnr_mu', float('nan')):.2f}"
+        ssim = f"{m.agg.get('ssim', float('nan')):.4f}"
+        gain = f"{m.agg.get('gain_db', float('nan')):+.2f}"
+        chroma = f"{100 * m.agg.get('chroma_ratio', float('nan')):.1f}"
+        sec = f"{m.agg.get('seconds', float('nan')):.3f}"
+        lines.append(f"{m.h} & {m.params_m:.2f} & {gflops} & {psnr} & {ssim} & "
+                     f"{gain} & {chroma} & {sec} \\\\")
+    missing = [m.h for m in members if not m.present]
+    lines += [r"\bottomrule", r"\end{tabular}", r"}", r"\end{table}"]
+    if missing:
+        lines.append(r"\par\noindent\textit{Note: film\_hidden = %s "
+                     r"had no checkpoint at report time and is omitted above.}"
+                     % ", ".join(str(h) for h in missing))
+    return "\n".join(lines) + "\n"
+
+
+def build_family_comparison_table(moe_members, film_members):
+    """
+    Every present run from both sweeps, ranked by PSNR-mu -- the direct
+    "is MoE or FiLM the better architecture" table.
+    """
+    rows = []
+    for m in moe_members:
+        if m.present and "psnr_mu" in m.agg:
+            rows.append(("MoE $K=%d$" % m.k, m.params_m, m.gflops, m.agg))
+    for m in film_members:
+        if m.present and "psnr_mu" in m.agg:
+            rows.append(("FiLM $h=%d$" % m.h, m.params_m, m.gflops, m.agg))
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: r[3].get("psnr_mu", float("-inf")), reverse=True)
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Every completed run from both sweeps, ranked by PSNR-$\mu$.}",
+        r"\label{tab:family}",
+        r"\small",
+        r"\resizebox{\textwidth}{!}{%",
+        r"\begin{tabular}{l r r r r r r}",
+        r"\toprule",
+        r"Architecture & Params (M) & GFLOPs/patch & PSNR-$\mu$ (dB) & SSIM & "
+        r"Gain (dB) & Chroma (\%) \\",
+        r"\midrule",
+    ]
+    for label, params_m, gflops, agg in rows:
+        gflops_s = f"{gflops:.2f}" if gflops is not None else "--"
+        lines.append(
+            f"{label} & {params_m:.2f} & {gflops_s} & "
+            f"{agg.get('psnr_mu', float('nan')):.2f} & "
+            f"{agg.get('ssim', float('nan')):.4f} & "
+            f"{agg.get('gain_db', float('nan')):+.2f} & "
+            f"{100 * agg.get('chroma_ratio', float('nan')):.1f} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}", r"}", r"\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def build_family_pgfplot(moe_members, film_members):
+    """Params vs PSNR-mu, one series per architecture -- the actual
+    efficiency-frontier plot, since K and film_hidden are not on a shared
+    x-axis but params (M) are."""
+    moe_pts = [(m.params_m, m.agg["psnr_mu"]) for m in moe_members
+              if m.present and "psnr_mu" in m.agg]
+    film_pts = [(m.params_m, m.agg["psnr_mu"]) for m in film_members
+               if m.present and "psnr_mu" in m.agg]
+    if len(moe_pts) + len(film_pts) < 2:
+        return ""
+    moe_pts.sort(); film_pts.sort()
+    moe_coords = " ".join(f"({p:.3f},{q:.3f})" for p, q in moe_pts)
+    film_coords = " ".join(f"({p:.3f},{q:.3f})" for p, q in film_pts)
+
+    moe_plot = (r"\addplot[mark=*, thick, color=blue!70!black] coordinates "
+               r"{%s}; \addlegendentry{MoE}" % moe_coords) if moe_pts else ""
+    film_plot = (r"\addplot[mark=triangle*, thick, color=teal!70!black] "
+                r"coordinates {%s}; \addlegendentry{FiLM}"
+                % film_coords) if film_pts else ""
+
+    return r"""
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.7\textwidth, height=6cm,
+    xlabel={Parameters (M)}, ylabel={PSNR-$\mu$ (dB)},
+    grid=major, title={Quality vs.\ parameter count, both architectures},
+    legend pos=south east,
+]
+%s
+%s
+\end{axis}
+\end{tikzpicture}
+\caption{Every completed run from both sweeps. A point further up-and-left
+is strictly better: same or higher quality at fewer parameters.}
+\label{fig:family-tradeoff}
+\end{figure}
+""" % (moe_plot, film_plot)
+
+
+def build_family_recommendation(moe_members, film_members):
+    moe_present = [m for m in moe_members if m.present and "psnr_mu" in m.agg]
+    film_present = [m for m in film_members if m.present and "psnr_mu" in m.agg]
+    if not moe_present or not film_present:
+        return ("Not enough completed runs in both sweeps to compare "
+                "architectures directly.")
+
+    best_moe = max(moe_present, key=lambda m: m.agg["psnr_mu"])
+    best_film = max(film_present, key=lambda m: m.agg["psnr_mu"])
+    delta = best_film.agg["psnr_mu"] - best_moe.agg["psnr_mu"]
+    smaller_film = [m for m in film_present if m.params_m <= best_moe.params_m]
+
+    lines = [
+        f"Best MoE run: $K={best_moe.k}$ at {best_moe.agg['psnr_mu']:.2f}~dB "
+        f"({best_moe.params_m:.2f}M params). "
+        f"Best FiLM run: film\\_hidden={best_film.h} at "
+        f"{best_film.agg['psnr_mu']:.2f}~dB ({best_film.params_m:.2f}M params) "
+        f"— a difference of {delta:+.2f}~dB at "
+        f"{best_film.params_m - best_moe.params_m:+.2f}M more params.",
+    ]
+    if smaller_film:
+        best_small = max(smaller_film, key=lambda m: m.agg["psnr_mu"])
+        lines.append(
+            f"Restricted to FiLM runs at or below the best MoE run's own "
+            f"param count, film\\_hidden={best_small.h} reaches "
+            f"{best_small.agg['psnr_mu']:.2f}~dB "
+            f"({best_small.agg['psnr_mu'] - best_moe.agg['psnr_mu']:+.2f}~dB "
+            f"vs.\\ best-MoE) at {best_small.params_m:.2f}M params "
+            f"({best_small.params_m - best_moe.params_m:+.2f}M vs.\\ best-MoE).")
+    return " ".join(lines)
 
 
 def build_comparison_table(members):
@@ -283,6 +494,33 @@ Bottom row: each expert's own output $\vert$ tone-mapped $|$error$|$.}
     return "\n".join(blocks) + "\n"
 
 
+def build_film_frame_figure(members, out_dir, frame_idx):
+    present = [m for m in members if m.present and m.panel]
+    if not present:
+        return ""
+    assets_dir = os.path.join(out_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    blocks = []
+    for m in present:
+        dest = f"filmH{m.h}_frame{frame_idx:04d}_panel.jpg"
+        shutil.copyfile(m.panel, os.path.join(assets_dir, dest))
+        blocks.append(r"""
+\begin{figure}[p]
+\centering
+\includegraphics[width=0.92\textwidth]{assets/%s}
+\caption{Test frame %d, FiLM $h=%d$ (%.2fM params, PSNR-$\mu$=%.2f~dB,
+chroma=%.0f\%%). Top row: noisy $\vert$ predicted $\vert$ reference.
+Bottom row: the single head's output $\vert$ tone-mapped $|$error$|$
+(no per-expert panel -- there is one head, not $K$).}
+\label{fig:frame-film-h%d}
+\end{figure}""" % (dest, frame_idx, m.h, m.params_m,
+                    m.agg.get("psnr_mu", float("nan")),
+                    100 * m.agg.get("chroma_ratio", float("nan")), m.h))
+
+    return "\n".join(blocks) + "\n"
+
+
 def build_architecture_diagram():
     """
     Box-and-arrow TikZ diagram of MoEDenoiser, matching
@@ -388,6 +626,94 @@ Table~\ref{tab:sweep}.}
 """
 
 
+def build_film_architecture_diagram():
+    """
+    Box-and-arrow TikZ diagram of FiLMDenoiser, matching
+    HDR_model_hybrid_Teacher.py's actual module wiring. Identical trunk to
+    MoEDenoiser's diagram (same modules, same skip connections) but the
+    bottom half is the actual structural difference under test: one head
+    instead of K, and a small FiLMGenerator producing a per-pixel
+    (gamma, beta) that modulates the trunk's own features directly, in
+    place of a gate that blends K separate outputs after the fact.
+    """
+    return r"""
+\begin{figure}[htbp]
+\centering
+\resizebox{0.85\textwidth}{!}{%
+\begin{tikzpicture}[
+    node distance=3mm and 8mm,
+    box/.style={draw, rounded corners, minimum width=32mm, minimum height=7mm,
+                align=center, font=\scriptsize, inner sep=1pt, fill=blue!4},
+    small/.style={draw, rounded corners, minimum width=24mm, minimum height=5mm,
+                align=center, font=\scriptsize, inner sep=1pt, fill=gray!8},
+    op/.style={draw, circle, minimum size=5mm, font=\small, inner sep=0pt},
+    io/.style={draw, rounded corners, minimum width=32mm, minimum height=6mm,
+               align=center, font=\scriptsize\bfseries, inner sep=1pt, fill=orange!12},
+    arr/.style={-{Latex[length=2mm]}, thick},
+]
+
+\node[io]  (input)    {Packed BGGR\\ $[4,H,W]$};
+\node[box, below=of input]   (embed)   {PixelUnshuffle(2) + Conv\\ patch embed $\to \ndim{}$};
+\node[box, below=of embed]   (enc1)    {Encoder L1\\ ResidualBlocks + SE\\ $\ndim{},\ H/2$};
+\node[small, below=of enc1]  (down1)   {PixelUnshuffle(2)};
+\node[box, below=of down1]   (enc2)    {Encoder L2\\ ResidualBlocks + SE\\ $4\ndim{},\ H/4$};
+\node[small, below=of enc2]  (down2)   {PixelUnshuffle(2)};
+\node[box, below=of down2, fill=violet!8] (latent) {Restormer Latent\\ transformer blocks\\ $16\ndim{},\ H/8$};
+\node[small, below=of latent] (up2)    {PixelShuffle(2)};
+\node[box, below=of up2]     (dec2)    {Decoder L2\\ ResidualBlocks\\ $\to 4\ndim{},\ H/4$};
+\node[small, below=of dec2]  (up1)     {PixelShuffle(2)};
+\node[box, below=of up1, fill=green!8] (dec1) {Decoder L1 (trunk output)\\ ResidualBlocks\\ $2\ndim{},\ H/2$};
+
+\draw[arr] (input) -- (embed);
+\draw[arr] (embed) -- (enc1);
+\draw[arr] (enc1)  -- (down1);
+\draw[arr] (down1) -- (enc2);
+\draw[arr] (enc2)  -- (down2);
+\draw[arr] (down2) -- (latent);
+\draw[arr] (latent) -- (up2);
+\draw[arr] (up2)   -- (dec2);
+\draw[arr] (dec2)  -- (up1);
+\draw[arr] (up1)   -- (dec1);
+
+\draw[arr, dashed] (enc2.east) to[bend left=35] node[right, font=\tiny, xshift=1mm]
+    {skip (concat)} (dec2.east);
+\draw[arr, dashed] (enc1.east) to[bend left=55] node[right, font=\tiny, xshift=6mm]
+    {skip (concat)} (dec1.east);
+
+% ---- FiLM: a small generator that modulates the trunk output directly ----
+\node[io, right=22mm of input, yshift=-3mm] (noisyin) {Noisy BGGR\\ $[4,H,W]$};
+\node[io, below=4mm of noisyin] (snrin) {Local SNR map\\ $[1,H,W]$};
+\node[box, below=5mm of snrin, fill=red!8] (film) {FiLMGenerator\\ PixelUnshuffle(2) + 2 conv\\ $\to (\gamma,\beta)$, each $2\ndim{},\ H/2$};
+
+\draw[arr] (noisyin) -- (snrin);
+\draw[arr] (noisyin) |- (film);
+\draw[arr] (snrin)  -- (film);
+
+\node[op, below=10mm of dec1] (mod) {$\odot$};
+\draw[arr] (dec1) -- (mod);
+\draw[arr] (film.south) |- node[below, font=\tiny, pos=0.9]
+    {feat $\cdot(1+\gamma)+\beta$} (mod.east);
+
+\node[box, below=6mm of mod, fill=yellow!10] (head) {Single head\\ ResBlocks + $2\times$PixelShuffle\\ $\to$ RGB $[3,2H,2W]$};
+\draw[arr] (mod) -- (head);
+
+\node[io, below=6mm of head] (out) {Output RGB\\ $[3,2H,2W]$};
+\draw[arr] (head) -- (out);
+
+\end{tikzpicture}}
+\caption{\texttt{FiLMDenoiser} architecture. Identical trunk to
+\texttt{MoEDenoiser} (Figure~\ref{fig:architecture}) through the decoder,
+but the noise-adaptive behaviour is a per-pixel affine transform of the
+trunk's own features -- $\text{feat}\cdot(1+\gamma)+\beta$ -- rather than a
+blend of $K$ separately-computed expert outputs. $\gamma,\beta$ come from a
+small generator (a few thousand parameters, comparable to NoiseGate) reading
+the same raw input and SNR map the MoE gate used, then a single lightweight
+head (identical topology to one MoE expert head) produces the final RGB.}
+\label{fig:film-architecture}
+\end{figure}
+"""
+
+
 def build_recommendation(members):
     present = [m for m in members if m.present and "psnr_mu" in m.agg]
     if len(present) < 2:
@@ -468,6 +794,10 @@ color-filter-array phase on roughly three quarters of samples, driving the
 model to predict near-grayscale output. The last of these is verified
 fixed in this report (Section~\ref{sec:color}); the $K$ sweep in
 Section~\ref{sec:sweep} is trained entirely with the corrected pipeline.
+The num-experts sweep itself motivated a second architecture,
+\texttt{FiLMDenoiser} (Section~\ref{sec:film}): the same trunk with one
+head continuously modulated by the noisy input and SNR map, in place of
+$K$ expert heads and a router, evaluated head-to-head against every $K$.
 \end{abstract}
 
 \tableofcontents
@@ -565,11 +895,48 @@ directory, which flag exactly this failure mode per run.
 
 %(frame_figure)s
 
+\section{FiLM: continuous conditioning instead of routing}
+\label{sec:film}
+Motivation, from the num-experts sweep above: per-expert PSNR spread never
+exceeded 0.11~dB at any $K$ tested, and three measured properties of this
+pipeline point at the routing mechanism rather than at $K$ being mistuned
+--- expert heads are $\approx$150K parameters against a $\approx$20M-param
+trunk (97--99\%% of every parameter is shared), local SNR correlates
+$r=0.37$--$0.88$ with raw pixel brightness on real training crops (much of
+what the gate routes on is already inferable without an explicit branch),
+and SNR varies $\sim$3$\times$ more across training crops than within one
+(a per-pixel router acting on a single crop cannot exploit the dominant
+source of variation anyway). \texttt{FiLMDenoiser}
+(Figure~\ref{fig:film-architecture}) replaces the $K$ experts and gate with
+one head, continuously modulated per-pixel by a small generator reading the
+same (noisy input, SNR map) signal.
+
+%(film_architecture_diagram)s
+
+film\_hidden $\in \{%(h_list)s\}$ trained simultaneously, one process per
+GPU, all with the identical Phase~1 recipe as the num-experts sweep (50
+epochs, 512$\times$512 patches, batch 8, the corrected augmentation).
+Evaluated the same way, on the full held-out test split at full sensor
+resolution.
+
+%(film_table)s
+
+\subsection{FiLM vs.\ MoE, head to head}
+%(family_table)s
+
+%(family_pgfplot)s
+
+%(family_recommendation)s
+
+%(film_frame_figure)s
+
 \section{Reproducing this report}
 \begin{verbatim}
 qsub -v HDR_SWEEP_TAG=%(tag)s scripts/polaris/sweep_experts.pbs
 qsub -v HDR_SWEEP_TAG=%(tag)s scripts/polaris/sweep_experts_eval.pbs
-python scripts/build_sweep_report.py --tag %(tag)s --compile
+qsub -v HDR_SWEEP_TAG=%(film_tag)s scripts/polaris/sweep_film.pbs
+qsub -v HDR_SWEEP_TAG=%(film_tag)s scripts/polaris/sweep_film_eval.pbs
+python scripts/build_sweep_report.py --tag %(tag)s --film-tag %(film_tag)s --compile
 \end{verbatim}
 Per-frame figures, per-image metrics (\texttt{results.csv}) and a
 plain-language summary (\texttt{summary.md}, including automatic
@@ -588,6 +955,12 @@ each run's own \texttt{summary.md} warning before concluding a given $K$ is
 usage indicates the router is not exploiting the specialisation the experts
 did learn, which is a different problem from experts that never
 differentiated in the first place.
+\item The MoE/FiLM comparison in Section~\ref{sec:film} is fair in the
+sense that mattered most going in: both share the identical trunk topology,
+data, augmentation, loss and training schedule, so the difference in the
+comparison table is attributable to the routing-vs-conditioning mechanism
+and not to a confound elsewhere in the pipeline. It is Phase~1 only, same
+caveat as above.
 \item Two smaller, previously-documented bugs remain unfixed and out of
 scope here: an even \texttt{window\_size} in the SNR-map estimator
 under-pads by one pixel (unreachable in production, since every call site
@@ -618,19 +991,38 @@ def main(argv=None):
         print("Nothing to report — no checkpoints found for this tag.")
         return 1
 
+    film_tag = args.film_tag or args.tag
+    film_members = [FilmMember(h, film_tag) for h in args.film_widths]
+    for m in film_members:
+        m.load(args.frame)
+    n_film_present = sum(m.present for m in film_members)
+    print(f"FiLM sweep tag '{film_tag}': "
+          f"{n_film_present}/{len(film_members)} checkpoints found")
+    for m in film_members:
+        status = f"epoch {m.epoch}, {m.params_m:.2f}M params" if m.present else "MISSING"
+        print(f"  film_hidden={m.h}: {status}")
+
     os.makedirs(args.out, exist_ok=True)
 
     doc = TEMPLATE % {
         "date": date.today().isoformat(),
         "k_list": ", ".join(str(m.k) for m in members),
+        "h_list": ", ".join(str(m.h) for m in film_members),
         "comparison_table": build_comparison_table(members),
         "architecture_diagram": build_architecture_diagram(),
+        "film_architecture_diagram": build_film_architecture_diagram(),
         "gate_table": build_gate_table(members),
         "pgfplot": build_pgfplot(members),
         "recommendation": build_recommendation(members),
         "frame_figure": build_frame_figure(members, args.out, args.frame),
+        "film_table": build_film_table(film_members),
+        "film_frame_figure": build_film_frame_figure(film_members, args.out, args.frame),
+        "family_table": build_family_comparison_table(members, film_members),
+        "family_pgfplot": build_family_pgfplot(members, film_members),
+        "family_recommendation": build_family_recommendation(members, film_members),
         "tag": args.tag,
         "tag_escaped": tex_escape(args.tag),
+        "film_tag": film_tag,
     }
 
     tex_path = os.path.join(args.out, "report.tex")
