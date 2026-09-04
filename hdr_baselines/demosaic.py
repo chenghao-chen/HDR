@@ -290,4 +290,16 @@ class GBTFDemosaic(_DemosaicOnly):
             p.requires_grad_(False)
 
     def demosaic(self, mosaic: torch.Tensor) -> torch.Tensor:
-        return self.gbtf(mosaic)
+        # Follow the input's device. Unlike the bilinear/Malvar functions,
+        # which build their kernels on mosaic.device every call, GBTF is a
+        # Module whose buffers live wherever it was constructed — the CPU,
+        # since the registry caches one instance lazily. Feeding it a CUDA
+        # tensor otherwise raises "Input type (torch.cuda.FloatTensor) and
+        # weight type (torch.FloatTensor) should be the same", which is what
+        # every GPU benchmark run hit: BenchmarkRunner demosaics the on-device
+        # ground truth with gt_demosaic="gbtf" by default.
+        buf = next(self.gbtf.buffers())
+        if buf.device != mosaic.device:
+            self.gbtf.to(mosaic.device)
+            buf = next(self.gbtf.buffers())
+        return self.gbtf(mosaic.to(buf.dtype))

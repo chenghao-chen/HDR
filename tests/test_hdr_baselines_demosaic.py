@@ -194,3 +194,58 @@ class TestFunctionalInterface:
         out = demosaic_malvar(packed, "BGGR")
         assert out.shape[0] == 2
         assert not torch.allclose(out[0], out[1])
+
+
+class TestGBTFDeviceHandling:
+    """
+    GBTF is the only demosaicer here that is a Module rather than a function.
+    bilinear and Malvar build their kernels on ``mosaic.device`` every call, so
+    they follow the input for free; GBTF's kernels are registered buffers that
+    live wherever the instance was built — and the registry in
+    hdr_baselines.pipelines caches exactly one instance, lazily, on the CPU.
+
+    Feeding that cached instance a CUDA tensor used to raise "Input type
+    (torch.cuda.FloatTensor) and weight type (torch.FloatTensor) should be the
+    same". It was not a corner case: BenchmarkRunner demosaics the on-device
+    ground truth with gt_demosaic="gbtf" by default, so every GPU benchmark
+    run died on its first frame.
+    """
+
+    def test_dtype_follows_the_input(self):
+        from hdr_baselines.demosaic import GBTFDemosaic
+        m = GBTFDemosaic()
+        out = m.demosaic(torch.rand(1, 1, 16, 16, dtype=torch.float64))
+        assert torch.isfinite(out).all()
+
+    @pytest.mark.gpu
+    def test_the_cached_instance_follows_the_input_to_the_gpu(self, gpu_device):
+        """
+        The registry path, which is the one the benchmark actually uses: a
+        CPU-built cached module must accept a GPU tensor and return a GPU
+        result matching the CPU one.
+        """
+        from hdr_baselines.pipelines import DEMOSAIC_FUNCTIONS
+        fn = DEMOSAIC_FUNCTIONS["gbtf"]
+        mosaic = torch.rand(1, 1, 32, 32)
+
+        cpu_out = fn(mosaic, "BGGR")
+        gpu_out = fn(mosaic.to(gpu_device), "BGGR")
+
+        assert gpu_out.device.type == gpu_device.type
+        assert torch.allclose(cpu_out, gpu_out.cpu(), atol=1e-5)
+
+    @pytest.mark.gpu
+    def test_it_still_works_on_the_cpu_after_a_gpu_call(self, gpu_device):
+        """
+        The instance is shared and moves in place, so a GPU call must not
+        strand it: the next CPU frame has to keep working. Mixed-device
+        evaluation in one process is the normal case, not an exotic one.
+        """
+        from hdr_baselines.pipelines import DEMOSAIC_FUNCTIONS
+        fn = DEMOSAIC_FUNCTIONS["gbtf"]
+        mosaic = torch.rand(1, 1, 32, 32)
+
+        fn(mosaic.to(gpu_device), "BGGR")
+        back = fn(mosaic, "BGGR")
+        assert back.device.type == "cpu"
+        assert torch.isfinite(back).all()

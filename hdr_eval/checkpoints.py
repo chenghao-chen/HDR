@@ -7,16 +7,10 @@ weights — ``mode``, ``model_kwargs`` and ``num_experts`` — precisely so a
 benchmark does not have to be kept in sync by hand. This module reads
 them.
 
-One difference from ``test_dual_MoE_two_phase.load_model_from_checkpoint``
-is deliberate and worth stating: that function currently hardcodes
-
-    num_experts = 2 #ckpt.get("num_experts", fallback_num_experts)
-
-so a 3-expert checkpoint is rebuilt as a 2-expert model and the load
-fails, or (worse, for a `dual` checkpoint where the count happens to
-match) succeeds while describing the model wrongly in the report. Here
-the stored value is used, and the fallback applies only when the
-checkpoint predates the metadata.
+The stored ``num_experts`` is used, and the fallback applies only when the
+checkpoint predates the metadata. ``test_dual_MoE_two_phase`` used to
+hardcode ``num_experts = 2`` here, which rebuilt a 3-expert checkpoint as a
+2-expert model and failed the load; both now read the stored value.
 """
 
 from __future__ import annotations

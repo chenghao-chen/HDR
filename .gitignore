@@ -17,3 +17,9 @@ wandb/
 
 # oneAPI JIT kernel cache (Aurora). Hundreds of MB, regenerated on demand.
 .sycl_cache/
+
+# Per-frame test figures (regenerate with scripts/save_test_outputs.py)
+test_visuals/
+
+# Core dumps
+core.*

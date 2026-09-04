@@ -41,4 +41,21 @@ fi
 hdr::preflight || hdr::warn "continuing despite check failures"
 
 hdr::run "$HDR_PYTHON" test_dual_MoE_two_phase.py
-exit $?
+bench_status=$?
+
+# Stage 2: the figures. Separate from the benchmark above because this is
+# what you actually look at — per-frame noisy/predicted/reference over each
+# expert's own output, plus the routing map. A mixture can post a fine
+# blended PSNR while both experts have converged to the same function, and
+# only the per-expert panels show that.
+hdr::log ""
+hdr::log "################ 2. Per-frame visuals ################################"
+hdr::run "$HDR_PYTHON" scripts/save_test_outputs.py
+visuals_status=$?
+
+hdr::log ""
+hdr::log "benchmark exit : $bench_status"
+hdr::log "visuals   exit : $visuals_status"
+
+(( bench_status == 0 && visuals_status == 0 )) || exit 1
+exit 0
