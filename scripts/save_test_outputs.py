@@ -164,7 +164,8 @@ def main(argv=None):
                           ("cuda", "xpu") else None)
 
     fieldnames = (["frame", "psnr_mu", "psnr_linear", "ssim",
-                   "noisy_psnr_mu", "gain_db"]
+                   "noisy_psnr_mu", "gain_db", "chroma_pred", "chroma_gt",
+                   "chroma_ratio"]
                   + [f"expert{k}_psnr_mu" for k in range(K)]
                   + [f"expert{k}_gate_mean" for k in range(K)]
                   + ["seconds"])
@@ -189,12 +190,24 @@ def main(argv=None):
         tm_pred = mu_law(out.blended.clamp(0, 1), args.mu)
         tm_noisy = mu_law(noisy_rgb, args.mu)
 
+        # Colour-fidelity check, independent of PSNR/SSIM: mean |channel -
+        # luma|. A model that quietly collapses to R = B (see BENCHMARKING.md,
+        # "The CFA phase question") can still score well on PSNR/SSIM if the
+        # scene is dim, since those are luma-dominated; this is not.
+        chroma_pred = float((out.blended.clamp(0, 1)
+                             - out.blended.clamp(0, 1).mean(1, keepdim=True)
+                             ).abs().mean())
+        chroma_gt = float((gt_rgb - gt_rgb.mean(1, keepdim=True)).abs().mean())
+
         row = {
             "frame": i,
             "psnr_mu": psnr(tm_pred, tm_gt),
             "psnr_linear": psnr(out.blended.clamp(0, 1), gt_rgb),
             "ssim": ssim(tm_pred, tm_gt),
             "noisy_psnr_mu": psnr(tm_noisy, tm_gt),
+            "chroma_pred": chroma_pred,
+            "chroma_gt": chroma_gt,
+            "chroma_ratio": chroma_pred / max(chroma_gt, 1e-9),
             "seconds": elapsed,
         }
         row["gain_db"] = row["psnr_mu"] - row["noisy_psnr_mu"]
@@ -241,7 +254,8 @@ def main(argv=None):
             f"e{k}={row[f'expert{k}_psnr_mu']:.2f}" for k in range(K))
         print(f"  frame {i:3d}  PSNR-mu {row['psnr_mu']:6.2f} dB "
               f"(noisy {row['noisy_psnr_mu']:5.2f}, {row['gain_db']:+.2f})  "
-              f"SSIM {row['ssim']:.4f}  {experts_txt}  {elapsed:.2f}s")
+              f"SSIM {row['ssim']:.4f}  chroma {row['chroma_ratio']:5.1%}  "
+              f"{experts_txt}  {elapsed:.2f}s")
 
     if not rows:
         print("No frames evaluated.")
@@ -282,6 +296,7 @@ def main(argv=None):
         f"| SSIM | {avg('ssim'):.4f} |",
         f"| noisy input PSNR-mu | {avg('noisy_psnr_mu'):.2f} dB |",
         f"| **gain over input** | **{avg('gain_db'):+.2f} dB** |",
+        f"| **chroma retention** | **{avg('chroma_ratio'):.1%}** of reference |",
         f"| seconds / frame | {avg('seconds'):.2f} |",
         "",
     ]
@@ -308,6 +323,14 @@ def main(argv=None):
             lines.append(f"> **Experts are near-duplicates**: their solo PSNRs "
                          f"differ by only {spread:.2f} dB, so the mixture is "
                          f"buying little over a single head of the same size.")
+    if avg("chroma_ratio") < 0.5:
+        lines.append("")
+        lines.append(f"> **Output is desaturated**: the model retains only "
+                     f"{avg('chroma_ratio'):.0%} of the reference's chroma "
+                     f"(mean |channel - luma|, pred vs. GT). A healthy model "
+                     f"should track near 100%. This is the signature of the "
+                     f"CFA-phase augmentation bug — see BENCHMARKING.md's "
+                     f"\"The CFA phase question\" — not a denoising failure.")
     lines += ["", "## Range", "",
               f"* best:  frame {best['frame']} at {best['psnr_mu']:.2f} dB "
               f"(`frame_{best['frame']:04d}_panel.jpg`)",

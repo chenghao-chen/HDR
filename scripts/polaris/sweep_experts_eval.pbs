@@ -1,0 +1,84 @@
+#!/bin/bash -l
+#PBS -N hdr_sweep_eval
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Evaluate the num-experts sweep — benchmark + per-frame visuals for K in
+# {1,2,3,4}, one checkpoint per GPU, in parallel.
+#
+#   qsub -v HDR_SWEEP_TAG=colorfix scripts/polaris/sweep_experts_eval.pbs
+#
+# Companion to sweep_experts.pbs: same tag, same K values, reads
+# models_p1_moe_K{K}_<tag>_polaris/phase1_best.pth and writes
+# test_results/models_p1_moe_K{K}_<tag>_polaris/ and
+# test_visuals/models_p1_moe_K{K}_<tag>_polaris/ for each.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::preflight || hdr::warn "continuing despite check failures"
+
+TAG="${HDR_SWEEP_TAG:-sweep}"
+EXPERTS=(1 2 3 4)
+PIDS=()
+CKPTS=()
+
+for i in "${!EXPERTS[@]}"; do
+    K="${EXPERTS[$i]}"
+    CKPT="models_p1_moe_K${K}_${TAG}_polaris/phase1_best.pth"
+    LOG="logs/${PBS_JOBID:-interactive}_eval_K${K}.log"
+    CKPTS+=("$CKPT")
+
+    if [[ ! -f "$CKPT" ]]; then
+        hdr::log "K=${K}: SKIPPED — no checkpoint at ${CKPT}"
+        PIDS+=(0)
+        continue
+    fi
+
+    hdr::log "evaluating K=${K} on GPU ${i} -> ${CKPT}  (log: ${LOG})"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_CHECKPOINT="$CKPT"
+        "$HDR_PYTHON" test_dual_MoE_two_phase.py \
+            && "$HDR_PYTHON" scripts/save_test_outputs.py --checkpoint "$CKPT"
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on evaluation runs: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!EXPERTS[@]}"; do
+    K="${EXPERTS[$i]}"
+    pid="${PIDS[$i]}"
+    if [[ "$pid" == "0" ]]; then
+        status=1
+        continue
+    fi
+    if wait "$pid"; then
+        hdr::log "K=${K} (pid ${pid}): OK"
+    else
+        code=$?
+        hdr::log "K=${K} (pid ${pid}): FAILED (exit $code)"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "eval sweep finished : $(date)"
+hdr::log "overall status       : $status"
+hdr::head
+exit $status

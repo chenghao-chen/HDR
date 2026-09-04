@@ -1,0 +1,93 @@
+#!/bin/bash -l
+#PBS -N hdr_sweep_experts
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Num-experts sweep on Polaris — one Phase 1 training run per GPU, all 4 GPUs
+# of one node, at once.
+#
+#   qsub scripts/polaris/sweep_experts.pbs
+#   qsub -v HDR_SWEEP_TAG=myrun scripts/polaris/sweep_experts.pbs
+#
+# Trains MoEDenoiser with K = 1, 2, 3, 4 experts in parallel — one process per
+# GPU, pinned with CUDA_VISIBLE_DEVICES, each with its own HDR_SAVE_FOLDER so
+# the four runs cannot collide. Answers a real open question from the
+# project: is the 2-expert MoE actually earning its extra parameters and
+# latency over a single-expert model, and does adding more experts help
+# further? See test_visuals/*/summary.md's "near-duplicate experts" warning
+# for the finding that motivated this.
+#
+# Uses the corrected D4Transform(mode="cell") augmentation (train.pbs uses
+# the same trainer, so it gets this fix too — it is not sweep-specific).
+#
+# 60-minute debug-queue cap: a solo Phase 1 run takes ~52 min; four sharing
+# one node's CPU may run a little slower. That is not a real risk here:
+# latest.pth is written every epoch and HDR_SAVE_FOLDER is fixed per K, so if
+# the walltime limit kills a run mid-epoch, nothing beyond that epoch is
+# lost, and resubmitting this same script picks every run back up where it
+# left off (only the still-incomplete ones do meaningful work the second
+# time; a finished K exits in seconds once its checkpoint is already done —
+# though at 50 fixed epochs it will just retrain, so re-check exit status
+# per K rather than assuming a resubmit is free).
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::preflight || hdr::die "environment is not usable; not starting the sweep"
+
+TAG="${HDR_SWEEP_TAG:-sweep}"
+EXPERTS=(1 2 3 4)
+PIDS=()
+FOLDERS=()
+
+for i in "${!EXPERTS[@]}"; do
+    K="${EXPERTS[$i]}"
+    FOLDER="models_p1_moe_K${K}_${TAG}_polaris/"
+    LOG="logs/${PBS_JOBID:-interactive}_K${K}.log"
+    FOLDERS+=("$FOLDER")
+    hdr::log "launching K=${K} on GPU ${i} -> ${FOLDER}  (log: ${LOG})"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_NUM_EXPERTS="$K"
+        export HDR_SAVE_FOLDER="$FOLDER"
+        # Halved from Phase 1's solo default (8): four processes sharing one
+        # node's CPU cores would otherwise launch 32 dataloader workers on
+        # top of the four main training processes.
+        export HDR_DATALOADER_WORKERS=4
+        "$HDR_PYTHON" train_A100_MoE_two_phase.py
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on ${#PIDS[@]} background runs: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!EXPERTS[@]}"; do
+    K="${EXPERTS[$i]}"
+    if wait "${PIDS[$i]}"; then
+        hdr::log "K=${K} (pid ${PIDS[$i]}): OK      -> ${FOLDERS[$i]}"
+    else
+        code=$?
+        hdr::log "K=${K} (pid ${PIDS[$i]}): FAILED (exit $code) -> logs/${PBS_JOBID:-interactive}_K${K}.log"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "sweep finished : $(date)"
+hdr::log "overall status : $status"
+hdr::head
+exit $status

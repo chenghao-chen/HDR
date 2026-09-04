@@ -36,6 +36,12 @@ Usage
             the Phase 1 run.  Phase 2 auto-loads it if no Phase 2 checkpoint
             exists in the current save folder.
 
+  HDR_MODE / HDR_NUM_EXPERTS / HDR_DATALOADER_WORKERS override MODE /
+  NUM_EXPERTS / the dataloader worker count, same pattern as HDR_SAVE_FOLDER.
+  Meant for launching several configurations in parallel, one process per GPU
+  on a node, each with CUDA_VISIBLE_DEVICES pinned to a different device and
+  its own HDR_SAVE_FOLDER — see scripts/polaris/sweep_experts.pbs.
+
 D4 augmentation for BGGR packed Bayer
 ──────────────────────────────────────
 Each 2×2 Bayer cell holds  B(0,0) G1(0,1) G2(1,0) R(1,1)  → packed channels [0,1,2,3].
@@ -68,6 +74,7 @@ import wandb
 from HDR_model_hybrid_Teacher import build_denoiser, estimate_local_snr_map
 from HDR_Mobile_dataset import MobileHDRDataset
 from DifferentiableGBTF_BGGR import DifferentiableGBTF_BGGR
+from hdr_data import D4Transform
 from hdr_platform import (get_accelerator, resolve_dataset_dir,
                           resolve_project_root)
 
@@ -254,8 +261,13 @@ if __name__ == "__main__":
     #  TOP-LEVEL FLAGS  — the only lines you change between runs
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     PHASE       = 1        # 1 = patch training  |  2 = full-res fine-tune
-    MODE        = "moe"    # "moe" | "dual" | "single"
-    NUM_EXPERTS = 2        # MoE only: experts across noise levels
+    # MODE / NUM_EXPERTS are overridable via HDR_MODE / HDR_NUM_EXPERTS so a
+    # job script can launch several configurations in parallel — one process
+    # per GPU on a node — without editing this file per run. Plain literals
+    # still work for the single-run case; os.environ.get falls through to
+    # them when the variable is unset.
+    MODE        = os.environ.get("HDR_MODE", "moe")            # "moe" | "dual" | "single"
+    NUM_EXPERTS = int(os.environ.get("HDR_NUM_EXPERTS", "2"))  # MoE only
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
                            # stable torch+inductor on the cluster)
 
@@ -486,12 +498,27 @@ if __name__ == "__main__":
     if PHASE == 1:
         # Square patches: full 8-way D4. Crop happens inside the dataset
         # (before noise synthesis) — the transform only flips/transposes.
-        transform  = make_d4_transform(allow_transpose=True)
+        #
+        # D4Transform(mode="cell"), not make_d4_transform: the latter's
+        # channel permutation does not correctly track the CFA phase change
+        # under a true pixel-level flip (verified: only ~27% of its draws
+        # round-trip back to BGGR; the rest are silently mislabelled while
+        # the ground truth is always demosaiced as BGGR regardless). The
+        # network's loss-minimising response to that contradiction is to
+        # predict R = B = their average — measured at 16% of the reference's
+        # chroma on a trained checkpoint. mode="cell" moves each 2x2 Bayer
+        # cell as a unit instead of permuting channels, which keeps the CFA
+        # phase exactly BGGR on every draw (verified: 200/200). See
+        # BENCHMARKING.md's "The CFA phase question" and
+        # tests/test_hdr_data_augment.py. make_d4_transform itself is left
+        # exactly as it was — tests/test_d4_augmentation.py pins its
+        # (buggy) behaviour as a deliberate regression contract.
+        transform  = D4Transform(mode="cell", allow_transpose=True)
         crop_size  = PATCH_SIZE
         collate_fn = collate_xy    # uniform patch size, skip duplicate 'xm'
     else:
         # Non-square full frames: 4 dimension-preserving symmetries only.
-        transform  = make_d4_transform(allow_transpose=False)
+        transform  = D4Transform(mode="cell", allow_transpose=False)
         crop_size  = None
         collate_fn = collate_pad_to_max
 
@@ -512,7 +539,12 @@ if __name__ == "__main__":
         collate_fn=collate_fn,
         worker_init_fn=seed_worker,
         generator=worker_gen,
-        **ACC.dataloader_kwargs(num_workers=8 if PHASE == 1 else 4),
+        # Overridable so several training processes can share one node's
+        # CPU cores without oversubscribing it (a parallel sweep launches
+        # one process per GPU; each process's default worker count assumes
+        # it has the whole node to itself).
+        **ACC.dataloader_kwargs(num_workers=int(os.environ.get(
+            "HDR_DATALOADER_WORKERS", "8" if PHASE == 1 else "4"))),
     )
 
     n_batches = len(dataloader)
