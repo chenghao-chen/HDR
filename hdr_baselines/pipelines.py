@@ -52,8 +52,9 @@ def _demosaic_gbtf(mosaic: torch.Tensor, pattern: str) -> torch.Tensor:
     from .demosaic import GBTFDemosaic
     if not hasattr(_demosaic_gbtf, "_cached"):
         _demosaic_gbtf._cached = GBTFDemosaic(pattern=pattern)
-    model = _demosaic_gbtf._cached
-    return model.demosaic(mosaic.to(next(model.gbtf.buffers()).dtype))
+    # demosaic() moves the cached module onto the input's device and matches
+    # its dtype, so the one shared instance follows whatever it is fed.
+    return _demosaic_gbtf._cached.demosaic(mosaic)
 
 
 def _demosaic_nearest(mosaic: torch.Tensor, pattern: str) -> torch.Tensor:

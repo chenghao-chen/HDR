@@ -27,6 +27,7 @@ from hdr_eval.visualize import (
     save_error_heatmap,
     save_gate_map,
     save_image,
+    save_panel_grid,
     to_display,
 )
 
@@ -126,6 +127,65 @@ class TestComparison:
         path = save_comparison(str(tmp_path / "c.jpg"), {"only": rgb},
                                scale=1.0, label=False)
         assert image_size(path) == (64, 64)
+
+
+class TestPanelGrid:
+    """
+    The MoE figure: noisy/predicted/reference over each expert plus the
+    error map. Six panels in one row are unreadable, so these stack.
+    """
+
+    def test_rows_stack_vertically(self, tmp_path, rgb):
+        path = save_panel_grid(str(tmp_path / "g.jpg"),
+                               [{"a": rgb, "b": rgb}, {"c": rgb, "d": rgb}],
+                               scale=1.0, separator=4, label=False)
+        w, h = image_size(path)
+        assert w == 64 * 2 + 4          # two panels + one gap
+        assert h == 64 * 2 + 4          # two rows + one gap
+
+    def test_a_short_row_is_padded_not_stretched(self, tmp_path, rgb):
+        """
+        A 3-panel row over a 2-panel row must keep both rows' panels the
+        same size; stretching the short row would misrepresent it.
+        """
+        path = save_panel_grid(str(tmp_path / "g.jpg"),
+                               [{"a": rgb, "b": rgb, "c": rgb},
+                                {"d": rgb, "e": rgb}],
+                               scale=1.0, separator=4, label=False)
+        w, h = image_size(path)
+        assert w == 64 * 3 + 4 * 2      # width of the widest row
+        assert h == 64 * 2 + 4
+
+    def test_it_matches_save_comparison_for_a_single_row(self, tmp_path, rgb):
+        panels = {"a": rgb, "b": rgb}
+        one = save_panel_grid(str(tmp_path / "g.jpg"), [panels],
+                              scale=1.0, separator=4, label=True)
+        ref = save_comparison(str(tmp_path / "c.jpg"), panels,
+                              scale=1.0, separator=4, label=True)
+        assert image_size(one) == image_size(ref)
+
+    def test_labels_add_a_caption_bar_per_row(self, tmp_path, rgb):
+        rows = [{"a": rgb}, {"b": rgb}]
+        plain = save_panel_grid(str(tmp_path / "p.jpg"), rows,
+                                scale=1.0, separator=0, label=False)
+        labelled = save_panel_grid(str(tmp_path / "l.jpg"), rows,
+                                   scale=1.0, separator=0, label=True)
+        # One caption bar per row, not one for the whole figure.
+        assert image_size(labelled)[1] == image_size(plain)[1] + 18 * 2
+
+    def test_no_rows_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="at least one row"):
+            save_panel_grid(str(tmp_path / "g.jpg"), [])
+
+    def test_an_empty_row_is_rejected(self, tmp_path, rgb):
+        with pytest.raises(ValueError, match="at least one panel"):
+            save_panel_grid(str(tmp_path / "g.jpg"), [{"a": rgb}, {}])
+
+    def test_mismatched_sizes_within_a_row_are_rejected(self, tmp_path, rgb):
+        with pytest.raises(ValueError, match="matching sizes"):
+            save_panel_grid(str(tmp_path / "g.jpg"),
+                            [{"a": rgb, "b": torch.rand(1, 3, 32, 32)}],
+                            scale=1.0)
 
 
 class TestColorize:

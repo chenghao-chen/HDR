@@ -17,8 +17,9 @@ disk.  This file pins:
     non-negative;
   * the blending identity (exact in train mode, deliberately broken by the
     eval clamp);
-  * the zero-init training-stability contract (every expert starts at
-    _CLAMP_EPS, the gate starts uniform at 1/K);
+  * the init-stability contract (every expert starts clear of _CLAMP_EPS
+    with a small index-dependent stagger, the gate starts near-uniform
+    at 1/K);
   * the eval-only max clamp and the always-on min clamp;
   * the "one shared trunk, ~95% of compute" claim, expressed as parameters
     and as trunk-module invocation counts;
@@ -84,12 +85,13 @@ def _trunk_param_count(model):
 
 def _wake_experts(model, scale=0.5):
     """
-    Give every ExpertHead.proj_out non-zero weights.
+    Give every ExpertHead.proj_out large, clearly-distinct weights/biases.
 
-    Needed by any test that wants real (non-degenerate) expert outputs: at
-    construction proj_out is zeroed, so every expert emits exactly 0, which the
-    clamp(min=_CLAMP_EPS) then pins to the clamp floor — and the clamp kills the
-    gradient there (see test_fresh_model_produces_nonzero_gradients).
+    Needed by any test that wants strongly non-degenerate expert outputs:
+    construction already gives each head a small distinct bias and weight
+    scale (see MoEDenoiser's _EXPERT_INIT_SPREAD), but that separation is
+    tiny by design — this pushes it to something a test can assert on
+    without floating-point tolerance games.
     """
     with torch.no_grad():
         for j, head in enumerate(model.experts):
@@ -396,6 +398,41 @@ def test_fresh_gate_responds_weakly_to_the_snr_map(tiny_kwargs):
         "fresh gate is bit-identical across SNR — the head is zero-initialised again"
     assert float((g_lo - g_hi).abs().max()) < 1e-2, \
         "fresh gate routing swings too hard on SNR; init is not near-uniform"
+
+
+@pytest.mark.parametrize("K", [2, 3, 4])
+def test_fresh_experts_are_not_identically_initialised(tiny_kwargs, K):
+    """
+    K expert heads drawn from the SAME init distribution have no reason to
+    diverge during training: the router's only signal to prefer one over
+    another is how differently they already perform, which starts at "not
+    at all". Measured on the first trained checkpoint before this fix: gate
+    weights stayed within [0.492, 0.508] everywhere on real test frames,
+    essentially uncorrelated with the per-pixel SNR map the gate is
+    conditioned on, and the two experts converged to functions differing by
+    only ~4%.
+
+    MoEDenoiser now staggers each head's output bias multiplicatively by
+    its index (never additively, so it cannot cross zero and land a head at
+    or below the clamp floor for any K).
+    """
+    model = _moe(tiny_kwargs, num_experts=K)
+    biases = [float(h.proj_out.bias.mean()) for h in model.experts]
+
+    assert len(set(round(b, 6) for b in biases)) == K, \
+        f"expert biases are not distinct: {biases}"
+    assert all(b > 0 for b in biases), \
+        f"a stagger crossed zero, risking the clamp floor: {biases}"
+    assert biases == sorted(biases), \
+        "expert index should stagger monotonically, for a legible spread"
+
+
+def test_single_expert_init_is_unaffected_by_the_stagger(tiny_kwargs):
+    """K=1 has nothing to break symmetry with — the stagger must be a no-op."""
+    from HDR_model_hybrid_Teacher import _INIT_OUT_LEVEL
+    model = _moe(tiny_kwargs, num_experts=1)
+    assert float(model.experts[0].proj_out.bias.mean()) == pytest.approx(
+        _INIT_OUT_LEVEL, rel=1e-2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

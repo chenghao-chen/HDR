@@ -17,6 +17,10 @@ What it produces:
 ``save_gate_map``  The MoE router's per-pixel expert weights, as a colour
     composite for up to three experts or a strip beyond that. If the gate
     has collapsed onto one expert this shows it instantly.
+``save_panel_grid``  Several labelled rows stacked into one figure. A
+    mixture-of-experts frame needs more panels than fit legibly across a
+    single strip (noisy, every expert, the blend, the reference, the error),
+    and a 3-wide grid stays readable where a 6-wide strip does not.
 ``save_crop_comparison``  Matched zoomed crops across models, which is how
     demosaicing artefacts are actually judged.
 
@@ -38,6 +42,7 @@ __all__ = [
     "to_display",
     "save_image",
     "save_comparison",
+    "save_panel_grid",
     "save_error_heatmap",
     "save_gate_map",
     "save_crop_comparison",
@@ -123,16 +128,13 @@ def _label_strip(width: int, labels: Sequence[str], panel_width: int,
     return arr.view(height, width, 3).permute(2, 0, 1).float() / 255.0
 
 
-def save_comparison(path: str, panels: Mapping[str, torch.Tensor],
-                    mu: float = MU_DEFAULT, scale: float = 0.5,
-                    separator: int = 4, label: bool = True,
-                    quality: int = 92) -> str:
+def _compose_strip(panels: Mapping[str, torch.Tensor], mu: float, scale: float,
+                   separator: int, label: bool) -> torch.Tensor:
     """
-    Write a labelled left-to-right strip of tone-mapped panels.
+    One labelled row of tone-mapped panels as a [3, H, W] tensor.
 
-        save_comparison("out.jpg", {"noisy": x, "ours": p, "gt": g})
-
-    Panels must share spatial dimensions; that is the point of the figure.
+    Shared by save_comparison and save_panel_grid so a row means exactly the
+    same thing in both, including the caption offsets.
     """
     if not panels:
         raise ValueError("Need at least one panel.")
@@ -155,7 +157,62 @@ def save_comparison(path: str, panels: Mapping[str, torch.Tensor],
         panel_w = w + (separator if separator > 0 else 0)
         caption = _label_strip(strip.shape[-1], list(panels.keys()), panel_w)
         strip = torch.cat([caption, strip], dim=-2)
+    return strip
+
+
+def save_comparison(path: str, panels: Mapping[str, torch.Tensor],
+                    mu: float = MU_DEFAULT, scale: float = 0.5,
+                    separator: int = 4, label: bool = True,
+                    quality: int = 92) -> str:
+    """
+    Write a labelled left-to-right strip of tone-mapped panels.
+
+        save_comparison("out.jpg", {"noisy": x, "ours": p, "gt": g})
+
+    Panels must share spatial dimensions; that is the point of the figure.
+    """
+    strip = _compose_strip(panels, mu, scale, separator, label)
     return save_image(path, strip, quality=quality)
+
+
+def save_panel_grid(path: str, rows: Sequence[Mapping[str, torch.Tensor]],
+                    mu: float = MU_DEFAULT, scale: float = 0.5,
+                    separator: int = 4, label: bool = True,
+                    quality: int = 92) -> str:
+    """
+    Stack several labelled rows into one figure.
+
+        save_panel_grid("out.jpg", [
+            {"noisy": x, "ours": p, "reference": g},
+            {"expert0": e0, "expert1": e1, "error": err},
+        ])
+
+    Panels within a row must match in size, as for save_comparison; rows may
+    hold different numbers of panels and are left-aligned, with the short
+    ones padded on the right. Labels carry the per-panel metrics, which is
+    what makes the figure readable without a caption elsewhere.
+    """
+    if not rows:
+        raise ValueError("Need at least one row.")
+    strips = [_compose_strip(r, mu, scale, separator, label) for r in rows]
+
+    width = max(s.shape[-1] for s in strips)
+    padded = []
+    for s in strips:
+        if s.shape[-1] < width:
+            pad = torch.zeros(s.shape[0], s.shape[-2], width - s.shape[-1])
+            s = torch.cat([s, pad], dim=-1)
+        padded.append(s)
+
+    if separator > 0:
+        gap = torch.zeros(3, separator, width)
+        stacked = []
+        for i, s in enumerate(padded):
+            if i:
+                stacked.append(gap)
+            stacked.append(s)
+        padded = stacked
+    return save_image(path, torch.cat(padded, dim=-2), quality=quality)
 
 
 def colorize(values: torch.Tensor, vmin: Optional[float] = None,

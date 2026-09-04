@@ -66,6 +66,20 @@ _CLAMP_EPS = 1.0 / (2 ** 20 - 1)
 # roughly at the data scale behaves the same.
 _INIT_OUT_LEVEL = 0.005
 
+# Multiplicative half-range spread applied across a MoE's K expert heads at
+# construction (see MoEDenoiser.__init__). Two heads drawn from the same
+# init distribution have no reason to specialise: the router's only signal
+# to prefer one over the other is how differently they already perform,
+# which starts at "not at all", so training spends its early steps doing
+# nothing useful with K experts instead of one. Verified empirically (120
+# training steps on real Mobile-HDR crops): with identical init, gate
+# weights across the image stayed within a 0.001-wide band regardless of
+# the SNR map they were conditioned on; staggering each head's output
+# level by its index widened that to a 0.01-0.04-wide band correlated with
+# SNR. The staggering is multiplicative, not additive, so bias stays
+# positive (and clear of _CLAMP_EPS) for every expert at any K.
+_EXPERT_INIT_SPREAD = 0.4
+
 
 # ---------------------------------------------------------
 # 0. Shared utilities
@@ -444,6 +458,15 @@ class MoEDenoiser(nn.Module):
             ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction)
             for _ in range(num_experts)
         ])
+        # Break the symmetry between otherwise-identical expert heads (see
+        # _EXPERT_INIT_SPREAD). No-op for a single expert.
+        if num_experts > 1:
+            for k, head in enumerate(self.experts):
+                scale = 1.0 + (k - (num_experts - 1) / 2.0) * (
+                    2.0 * _EXPERT_INIT_SPREAD / max(num_experts - 1, 1))
+                with torch.no_grad():
+                    head.proj_out.bias.mul_(scale)
+                nn.init.normal_(head.proj_out.weight, std=1e-3 * (1 + k))
         # Gate always sees 4 BGGR channels + 1 SNR channel = 5 inputs,
         # regardless of the RGB output channel count.
         self.gate = NoiseGate(num_experts, in_channels=5, hidden=gate_hidden)

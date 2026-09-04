@@ -176,3 +176,25 @@ in [RUNNING.md](RUNNING.md).
   this, and `I2VideoDataset` refuses to index mp4 clips until it passes.
   Run it on a compute node, or pass `frames_root=` a directory of
   pre-extracted frames.
+
+## Looking at the output
+
+```bash
+python scripts/save_test_outputs.py                  # best checkpoint, all 28 frames
+python scripts/save_test_outputs.py --limit 6        # a quick look
+python scripts/save_test_outputs.py --crop-size 256  # small enough for a login node
+./scripts/submit.sh test                             # benchmark + visuals, on a GPU
+```
+
+Writes `test_visuals/<run>/frame_NNNN_panel.jpg` — noisy | predicted |
+reference on the top row, each expert's own output plus the tone-mapped
+absolute error on the bottom, every panel labelled with its own PSNR-µ —
+along with `frame_NNNN_gates.jpg` (per-pixel routing), `results.csv` and
+`summary.md`.
+
+The per-expert panels are the point. A mixture can report a healthy blended
+PSNR while both experts have converged to the same function, in which case
+the second expert costs parameters and latency and buys nothing. `summary.md`
+calls this out directly: it flags a collapsed router (any expert with a mean
+gate weight below 0.05) and near-duplicate experts (solo PSNRs within
+0.15 dB).
