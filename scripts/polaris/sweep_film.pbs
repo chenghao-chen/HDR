@@ -1,0 +1,91 @@
+#!/bin/bash -l
+#PBS -N hdr_sweep_film
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# FiLM-conditioning sweep on Polaris — one Phase 1 training run per GPU, all 4
+# GPUs of one node, at once.
+#
+#   qsub scripts/polaris/sweep_film.pbs
+#   qsub -v HDR_SWEEP_TAG=myrun scripts/polaris/sweep_film.pbs
+#
+# Trains FiLMDenoiser (one shared trunk, one head, continuously modulated by
+# a small per-pixel FiLM generator instead of K expert heads + a softmax
+# gate) at four generator widths — one process per GPU, pinned with
+# CUDA_VISIBLE_DEVICES, each with its own HDR_SAVE_FOLDER.
+#
+# Two questions in one sweep:
+#   1. head-to-head against scripts/polaris/sweep_experts.pbs's K=1..4 MoE
+#      results — does continuous per-pixel conditioning of one head match
+#      or beat discrete K-way routing, at comparable or lower params/FLOPs?
+#   2. does FiLM generator capacity matter (film_hidden=8..64, vs
+#      NoiseGate's hidden=16 default) — a second read on the "capacity too
+#      thin to matter" hypothesis the num-experts sweep raised, this time
+#      on the conditioning generator rather than the expert heads.
+#
+# 60-minute debug-queue cap, same reasoning as sweep_experts.pbs: latest.pth
+# is written every epoch and HDR_SAVE_FOLDER is fixed per width, so a
+# walltime kill loses at most one epoch and resubmitting this script picks
+# every run back up where it left off.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::preflight || hdr::die "environment is not usable; not starting the sweep"
+
+TAG="${HDR_SWEEP_TAG:-sweep}"
+WIDTHS=(8 16 32 64)
+PIDS=()
+FOLDERS=()
+
+for i in "${!WIDTHS[@]}"; do
+    H="${WIDTHS[$i]}"
+    FOLDER="models_p1_film_H${H}_${TAG}_polaris/"
+    LOG="logs/${PBS_JOBID:-interactive}_H${H}.log"
+    FOLDERS+=("$FOLDER")
+    hdr::log "launching film_hidden=${H} on GPU ${i} -> ${FOLDER}  (log: ${LOG})"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_MODE="film"
+        export HDR_FILM_HIDDEN="$H"
+        export HDR_SAVE_FOLDER="$FOLDER"
+        # Halved from Phase 1's solo default (8), same reasoning as
+        # sweep_experts.pbs: four processes sharing one node's CPU cores.
+        export HDR_DATALOADER_WORKERS=4
+        "$HDR_PYTHON" train_A100_MoE_two_phase.py
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on ${#PIDS[@]} background runs: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!WIDTHS[@]}"; do
+    H="${WIDTHS[$i]}"
+    if wait "${PIDS[$i]}"; then
+        hdr::log "film_hidden=${H} (pid ${PIDS[$i]}): OK      -> ${FOLDERS[$i]}"
+    else
+        code=$?
+        hdr::log "film_hidden=${H} (pid ${PIDS[$i]}): FAILED (exit $code) -> logs/${PBS_JOBID:-interactive}_H${H}.log"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "sweep finished : $(date)"
+hdr::log "overall status : $status"
+hdr::head
+exit $status

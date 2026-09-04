@@ -32,10 +32,13 @@ usage() {
 usage: scripts/submit.sh <job> [--site polaris|aurora] [--dry-run] [qsub args...]
 
 jobs:
-  smoke         GPU smoke test + full pytest suite       (debug queue, ~20-30 min)
-  train         two-phase training                       (long queue, 8 h)
-  test          evaluation of a checkpoint                (debug queue, 30 min)
-  sweep_experts K in {1,2,3,4}, one GPU each, in parallel  (debug queue, 1 h)
+  smoke         GPU smoke test + full pytest suite            (debug queue, ~20-30 min)
+  train         two-phase training                            (long queue, 8 h)
+  test          evaluation of a checkpoint                     (debug queue, 30 min)
+  sweep_experts      K in {1,2,3,4}, one GPU each, parallel     (debug queue, 1 h)
+  sweep_experts_eval eval companion to sweep_experts            (debug queue, 30 min)
+  sweep_film         FiLM: film_hidden in {8,16,32,64}, parallel (debug queue, 1 h)
+  sweep_film_eval    eval companion to sweep_film                (debug queue, 30 min)
 
 options:
   --site NAME   submit the scripts for NAME instead of the detected machine.
