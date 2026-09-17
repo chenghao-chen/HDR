@@ -36,11 +36,13 @@ Usage
             the Phase 1 run.  Phase 2 auto-loads it if no Phase 2 checkpoint
             exists in the current save folder.
 
-  HDR_MODE / HDR_NUM_EXPERTS / HDR_DATALOADER_WORKERS override MODE /
-  NUM_EXPERTS / the dataloader worker count, same pattern as HDR_SAVE_FOLDER.
+  HDR_MODE / HDR_NUM_EXPERTS / HDR_FILM_HIDDEN / HDR_DIM / HDR_DATALOADER_WORKERS
+  override MODE / NUM_EXPERTS / the FiLM generator width / the shared trunk
+  width / the dataloader worker count, same pattern as HDR_SAVE_FOLDER.
   Meant for launching several configurations in parallel, one process per GPU
   on a node, each with CUDA_VISIBLE_DEVICES pinned to a different device and
-  its own HDR_SAVE_FOLDER — see scripts/polaris/sweep_experts.pbs.
+  its own HDR_SAVE_FOLDER — see scripts/polaris/sweep_experts.pbs,
+  scripts/polaris/sweep_film.pbs, scripts/polaris/sweep_film_capacity.pbs.
 
 D4 augmentation for BGGR packed Bayer
 ──────────────────────────────────────
@@ -269,6 +271,7 @@ if __name__ == "__main__":
     MODE        = os.environ.get("HDR_MODE", "moe")            # "moe" | "dual" | "single" | "film"
     NUM_EXPERTS = int(os.environ.get("HDR_NUM_EXPERTS", "2"))  # MoE only
     FILM_HIDDEN = int(os.environ.get("HDR_FILM_HIDDEN", "16")) # film only
+    TRUNK_DIM   = int(os.environ.get("HDR_DIM", "32"))         # shared trunk width
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
                            # stable torch+inductor on the cluster)
 
@@ -357,7 +360,7 @@ if __name__ == "__main__":
     last_epoch_psnr_mu, last_epoch_loss = 0.0, 1e6
 
     model_kwargs = {
-        "dim":                  32,
+        "dim":                  TRUNK_DIM,
         "num_blocks":           [4, 4, 4, 4],
         "num_refinement_blocks": 4,
         "heads":                [1, 2, 4, 8],
