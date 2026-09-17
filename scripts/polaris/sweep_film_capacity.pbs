@@ -1,0 +1,105 @@
+#!/bin/bash -l
+#PBS -N hdr_sweep_film_capacity
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Trunk-capacity ablation on Polaris — one Phase 1 FiLMDenoiser training run
+# per GPU, all 4 GPUs of one node, at once.
+#
+#   qsub scripts/polaris/sweep_film_capacity.pbs
+#   qsub -v HDR_SWEEP_TAG=myrun scripts/polaris/sweep_film_capacity.pbs
+#
+# Both the num-experts sweep (K=1..4) and the FiLM sweep (film_hidden=8..64)
+# found quality nearly flat across their own swept axis -- neither routing
+# complexity nor conditioning-generator capacity moved PSNR-mu by more than
+# a few tenths of a dB. That leaves open the question this sweep is for: is
+# the ~20M-param shared trunk itself the binding capacity constraint, with
+# neither mechanism getting a chance to matter because the backbone
+# saturates first? film_hidden is held fixed at 16 (the best FiLM run from
+# the prior sweep) and only the trunk width (dim) varies:
+#
+#   GPU 0  dim=16  starved        (~5.2M params total, ~1/4 of baseline)
+#   GPU 1  dim=32  baseline       (~20.5M params, matches every prior run)
+#   GPU 2  dim=48  enlarged       (~46.0M params, ~2.25x baseline)
+#   GPU 3  dim=64  extra-enlarged (~81.7M params, ~4x baseline)
+#
+# dim=32 is a fresh run, not a reuse of the earlier FiLM h=16 checkpoint:
+# same tag, same job, same contemporaneous conditions as the other three,
+# so the four points are a clean, directly-comparable curve rather than
+# three new runs plus one two-week-old checkpoint.
+#
+# 60-minute debug-queue cap: dim=64 quadruples the trunk's parameter count
+# and will very likely need more than one 59-minute slot to reach 50
+# epochs -- FLOPs scale with dim roughly as badly as params do, unlike the
+# num-experts/FiLM sweeps where only a small head or generator scaled.
+# That is an accepted, known risk here, not a surprise: latest.pth is
+# written every epoch and HDR_SAVE_FOLDER is fixed per dim, so a walltime
+# kill loses at most one epoch and resubmitting this exact script picks
+# every run back up where it left off (finished runs exit in seconds).
+# Watch for CUDA OOM on dim=64/48 too -- untested at this width; if it
+# happens, HDR_DATALOADER_WORKERS is already halved below, and the next
+# lever is batch size, not currently overridable from this script.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::preflight || hdr::die "environment is not usable; not starting the sweep"
+
+TAG="${HDR_SWEEP_TAG:-sweep}"
+DIMS=(16 32 48 64)
+PIDS=()
+FOLDERS=()
+
+for i in "${!DIMS[@]}"; do
+    D="${DIMS[$i]}"
+    FOLDER="models_p1_film_D${D}_${TAG}_polaris/"
+    LOG="logs/${PBS_JOBID:-interactive}_D${D}.log"
+    FOLDERS+=("$FOLDER")
+    hdr::log "launching dim=${D} on GPU ${i} -> ${FOLDER}  (log: ${LOG})"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_MODE="film"
+        export HDR_FILM_HIDDEN="16"
+        export HDR_DIM="$D"
+        export HDR_SAVE_FOLDER="$FOLDER"
+        # Halved from Phase 1's solo default (8), same reasoning as
+        # sweep_experts.pbs / sweep_film.pbs: four processes sharing one
+        # node's CPU cores.
+        export HDR_DATALOADER_WORKERS=4
+        "$HDR_PYTHON" train_A100_MoE_two_phase.py
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on ${#PIDS[@]} background runs: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!DIMS[@]}"; do
+    D="${DIMS[$i]}"
+    if wait "${PIDS[$i]}"; then
+        hdr::log "dim=${D} (pid ${PIDS[$i]}): OK      -> ${FOLDERS[$i]}"
+    else
+        code=$?
+        hdr::log "dim=${D} (pid ${PIDS[$i]}): FAILED (exit $code) -> logs/${PBS_JOBID:-interactive}_D${D}.log"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "sweep finished : $(date)"
+hdr::log "overall status : $status"
+hdr::head
+exit $status

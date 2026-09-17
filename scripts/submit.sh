@@ -39,6 +39,8 @@ jobs:
   sweep_experts_eval eval companion to sweep_experts            (debug queue, 30 min)
   sweep_film         FiLM: film_hidden in {8,16,32,64}, parallel (debug queue, 1 h)
   sweep_film_eval    eval companion to sweep_film                (debug queue, 30 min)
+  sweep_film_capacity      trunk dim in {16,32,48,64}, parallel        (debug queue, 1 h)
+  sweep_film_capacity_eval eval companion to sweep_film_capacity       (debug queue, 30 min)
 
 options:
   --site NAME   submit the scripts for NAME instead of the detected machine.
