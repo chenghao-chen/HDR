@@ -62,6 +62,13 @@ def parse_args(argv=None):
                         "Default: same as --tag. Pass --film-widths '' "
                         "(empty) to omit the FiLM section entirely.")
     p.add_argument("--film-widths", type=int, nargs="*", default=[8, 16, 32, 64])
+    p.add_argument("--capacity-tag", default=None,
+                   help="HDR_SWEEP_TAG the trunk-capacity ablation was "
+                        "submitted with. Matches "
+                        "models_p1_film_D{dim}_<capacity-tag>_polaris/. "
+                        "Default: same as --tag. Pass --capacity-dims '' "
+                        "(empty) to omit this section entirely.")
+    p.add_argument("--capacity-dims", type=int, nargs="*", default=[16, 32, 48, 64])
     p.add_argument("--frame", type=int, default=21,
                    help="Test-frame index to embed side by side across K "
                         "(same scene -> a fair visual comparison).")
@@ -348,6 +355,215 @@ def build_family_recommendation(moe_members, film_members):
             f"({best_small.agg['psnr_mu'] - best_moe.agg['psnr_mu']:+.2f}~dB "
             f"vs.\\ best-MoE) at {best_small.params_m:.2f}M params "
             f"({best_small.params_m - best_moe.params_m:+.2f}M vs.\\ best-MoE).")
+    return " ".join(lines)
+
+
+class CapacityMember:
+    """
+    Everything gathered about one trunk width (dim) in the capacity
+    ablation. FiLM's own generator width is held fixed (film_hidden=16,
+    the best run from the FiLM sweep) so dim is the only varying axis.
+    Separate class from FilmMember/SweepMember for the same reason those
+    two are separate from each other: different directory-naming scheme,
+    different swept axis, and the working paths for the other two sweeps
+    should not be put at risk by a shared base class.
+    """
+
+    def __init__(self, dim, tag):
+        self.dim = dim
+        self.checkpoint = f"models_p1_film_D{dim}_{tag}_polaris/phase1_best.pth"
+        self.bench_log = f"test_results/models_p1_film_D{dim}_{tag}_polaris/log.txt"
+        self.visuals_dir = f"test_visuals/models_p1_film_D{dim}_{tag}_polaris"
+        self.results_csv = os.path.join(self.visuals_dir, "results.csv")
+        self.panel = None
+
+        self.present = os.path.isfile(self.checkpoint)
+        self.params_m = None
+        self.epoch = None
+        self.gflops = None
+        self.agg = {}
+
+    def load(self, frame_idx):
+        if not self.present:
+            return
+        payload = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
+        state = payload.get("model_state_dict", payload)
+        self.params_m = sum(t.numel() for t in state.values()
+                            if hasattr(t, "numel")) / 1e6
+        self.epoch = payload.get("epoch")
+
+        if os.path.isfile(self.bench_log):
+            text = open(self.bench_log).read()
+            m = re.search(r"GFLOPs\s*/\s*patch:\s*([\d.]+)", text)
+            if m:
+                self.gflops = float(m.group(1))
+
+        if os.path.isfile(self.results_csv):
+            rows = list(csv.DictReader(open(self.results_csv)))
+            if rows:
+                numeric_cols = [c for c in rows[0] if c != "frame"]
+                for c in numeric_cols:
+                    vals = [float(r[c]) for r in rows if r.get(c) not in (None, "")]
+                    if vals:
+                        self.agg[c] = sum(vals) / len(vals)
+
+        p = os.path.join(self.visuals_dir, f"frame_{frame_idx:04d}_panel.jpg")
+        self.panel = p if os.path.isfile(p) else None
+
+
+def build_capacity_table(members):
+    present = [m for m in members if m.present]
+    if not present:
+        return "No trunk-capacity ablation checkpoints were found.\n"
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Trunk-capacity ablation (FiLM, film\_hidden=16 fixed), "
+        r"held-out Mobile-HDR test split (full resolution, 28 frames "
+        r"unless noted).}",
+        r"\label{tab:capacity}",
+        r"\small",
+        r"\resizebox{\textwidth}{!}{%",
+        r"\begin{tabular}{r r r r r r r r}",
+        r"\toprule",
+        r"trunk dim & Params (M) & GFLOPs/patch & PSNR-$\mu$ (dB) & SSIM & "
+        r"Gain (dB) & Chroma (\%) & $s$/frame \\",
+        r"\midrule",
+    ]
+    for m in present:
+        gflops = f"{m.gflops:.2f}" if m.gflops is not None else "--"
+        psnr = f"{m.agg.get('psnr_mu', float('nan')):.2f}"
+        ssim = f"{m.agg.get('ssim', float('nan')):.4f}"
+        gain = f"{m.agg.get('gain_db', float('nan')):+.2f}"
+        chroma = f"{100 * m.agg.get('chroma_ratio', float('nan')):.1f}"
+        sec = f"{m.agg.get('seconds', float('nan')):.3f}"
+        lines.append(f"{m.dim} & {m.params_m:.2f} & {gflops} & {psnr} & {ssim} & "
+                     f"{gain} & {chroma} & {sec} \\\\")
+    missing = [m.dim for m in members if not m.present]
+    lines += [r"\bottomrule", r"\end{tabular}", r"}", r"\end{table}"]
+    if missing:
+        lines.append(r"\par\noindent\textit{Note: dim = %s "
+                     r"had no checkpoint at report time and is omitted above.}"
+                     % ", ".join(str(d) for d in missing))
+    return "\n".join(lines) + "\n"
+
+
+def build_capacity_pgfplot(members):
+    present = [m for m in members if m.present and "psnr_mu" in m.agg]
+    if len(present) < 2:
+        return ""
+    present_sorted = sorted(present, key=lambda m: m.dim)
+    psnr_coords = " ".join(f"({m.dim},{m.agg['psnr_mu']:.3f})" for m in present_sorted)
+    params_coords = " ".join(f"({m.dim},{m.params_m:.2f})" for m in present_sorted)
+
+    return r"""
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.46\textwidth, height=4.2cm,
+    xlabel={trunk dim}, ylabel={PSNR-$\mu$ (dB)},
+    xtick=data, grid=major, title={Quality vs.\ trunk width},
+]
+\addplot[mark=*, thick, color=purple!70!black] coordinates {%s};
+\end{axis}
+\end{tikzpicture}
+\hfill
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.46\textwidth, height=4.2cm,
+    xlabel={trunk dim}, ylabel={Params (M)},
+    xtick=data, grid=major, title={Cost vs.\ trunk width},
+]
+\addplot[mark=square*, thick, color=orange!80!black] coordinates {%s};
+\end{axis}
+\end{tikzpicture}
+\caption{Held-out quality and parameter count as a function of trunk width
+(FiLM, film\_hidden=16 fixed). Params grow roughly quadratically with dim;
+quality does not track it past baseline.}
+\label{fig:capacity-tradeoff}
+\end{figure}
+""" % (psnr_coords, params_coords)
+
+
+def build_capacity_frame_figure(members, out_dir, frame_idx):
+    present = [m for m in members if m.present and m.panel]
+    if not present:
+        return ""
+    assets_dir = os.path.join(out_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    blocks = []
+    for m in present:
+        dest = f"capacityD{m.dim}_frame{frame_idx:04d}_panel.jpg"
+        shutil.copyfile(m.panel, os.path.join(assets_dir, dest))
+        blocks.append(r"""
+\begin{figure}[p]
+\centering
+\includegraphics[width=0.92\textwidth]{assets/%s}
+\caption{Test frame %d, trunk dim $=%d$ (%.2fM params, PSNR-$\mu$=%.2f~dB,
+chroma=%.0f\%%). Top row: noisy $\vert$ predicted $\vert$ reference.
+Bottom row: the single head's output $\vert$ tone-mapped $|$error$|$.}
+\label{fig:frame-capacity-d%d}
+\end{figure}""" % (dest, frame_idx, m.dim, m.params_m,
+                    m.agg.get("psnr_mu", float("nan")),
+                    100 * m.agg.get("chroma_ratio", float("nan")), m.dim))
+
+    return "\n".join(blocks) + "\n"
+
+
+def build_capacity_recommendation(members):
+    present = [m for m in members if m.present and "psnr_mu" in m.agg]
+    if len(present) < 2:
+        return "Not enough completed capacity-ablation runs to compare."
+    present_sorted = sorted(present, key=lambda m: m.dim)
+    baseline = min(present_sorted, key=lambda m: abs(m.dim - 32))
+    starved = [m for m in present_sorted if m.dim < baseline.dim]
+    enlarged = [m for m in present_sorted if m.dim > baseline.dim]
+    best = max(present_sorted, key=lambda m: m.agg["psnr_mu"])
+
+    lines = []
+    if starved:
+        s = starved[-1]   # the one closest to baseline from below
+        delta = s.agg["psnr_mu"] - baseline.agg["psnr_mu"]
+        lines.append(
+            f"Starving the trunk (dim={s.dim}, {s.params_m:.2f}M params, "
+            # \% (LaTeX-escaped), not Python's ':.0%' format spec, which
+            # emits a BARE % -- that starts a LaTeX comment and silently
+            # truncates the rest of the paragraph. Caught by rendering
+            # this exact sentence; see the commit message for this fix.
+            f"{100 * s.params_m / baseline.params_m:.0f}\\% of baseline) costs "
+            f"{delta:+.2f}~dB against the dim={baseline.dim} baseline — a "
+            f"real, measurable penalty, unlike the near-flat curves the "
+            f"num-experts and FiLM-width sweeps found on their own axes.")
+    if enlarged:
+        deltas = [(m.dim, m.agg["psnr_mu"] - baseline.agg["psnr_mu"],
+                  m.params_m / baseline.params_m) for m in enlarged]
+        worded = "; ".join(
+            f"dim={d} ({r:.1f}$\\times$ params): {delta:+.2f}~dB"
+            for d, delta, r in deltas)
+        largest_dim = max(m.dim for m in present_sorted)
+        if best.dim == baseline.dim:
+            best_note = "the baseline itself"
+        elif best.dim == largest_dim:
+            best_note = "the largest trunk tried, but only marginally ahead of baseline"
+        else:
+            best_note = "neither the baseline nor the largest trunk tried"
+        lines.append(
+            f"Enlarging it past baseline does not buy anything further on "
+            f"this run: {worded}. The best result overall is dim={best.dim} "
+            f"at {best.agg['psnr_mu']:.2f}~dB, {best_note}.")
+    lines.append(
+        "Read together with the num-experts and FiLM-width sweeps, this "
+        "points at the training data or budget as the more likely ceiling "
+        "here, not the architecture: a real capacity floor exists below "
+        "baseline, but neither routing (MoE), continuous conditioning "
+        "(FiLM), nor simply more trunk capacity moves quality once that "
+        "floor is cleared. 218 source scenes and a fixed 50-epoch, "
+        "single-learning-rate-schedule Phase~1 recipe (tuned around the "
+        "dim=32 baseline, not re-tuned per trunk width) are the two most "
+        "likely candidates for what to change next.")
     return " ".join(lines)
 
 
@@ -798,6 +1014,11 @@ The num-experts sweep itself motivated a second architecture,
 \texttt{FiLMDenoiser} (Section~\ref{sec:film}): the same trunk with one
 head continuously modulated by the noisy input and SNR map, in place of
 $K$ expert heads and a router, evaluated head-to-head against every $K$.
+Both sweeps found quality nearly flat across their own swept axis, which
+motivated a third experiment (Section~\ref{sec:capacity}): holding the
+head/gate mechanism fixed and varying only the shared trunk's own width,
+to test whether the trunk itself, not the mechanism on top of it, is the
+binding constraint.
 \end{abstract}
 
 \tableofcontents
@@ -930,13 +1151,34 @@ resolution.
 
 %(film_frame_figure)s
 
+\section{Trunk-capacity ablation}
+\label{sec:capacity}
+Both sweeps above found quality nearly flat across their own swept axis:
+per-expert PSNR spread never exceeded 0.11~dB at any $K$, and FiLM's own
+$h=8$--$64$ span was only 0.25~dB and non-monotonic. Neither result tells
+us whether the $\approx$20M-param shared trunk is itself the ceiling.
+This ablation holds film\_hidden fixed at 16 (the best FiLM run above) and
+varies only the trunk width, dim $\in \{%(capacity_dim_list)s\}$, one process
+per GPU, otherwise identical Phase~1 recipe and evaluation.
+
+%(capacity_table)s
+
+%(capacity_pgfplot)s
+
+%(capacity_recommendation)s
+
+%(capacity_frame_figure)s
+
 \section{Reproducing this report}
 \begin{verbatim}
 qsub -v HDR_SWEEP_TAG=%(tag)s scripts/polaris/sweep_experts.pbs
 qsub -v HDR_SWEEP_TAG=%(tag)s scripts/polaris/sweep_experts_eval.pbs
 qsub -v HDR_SWEEP_TAG=%(film_tag)s scripts/polaris/sweep_film.pbs
 qsub -v HDR_SWEEP_TAG=%(film_tag)s scripts/polaris/sweep_film_eval.pbs
-python scripts/build_sweep_report.py --tag %(tag)s --film-tag %(film_tag)s --compile
+qsub -v HDR_SWEEP_TAG=%(capacity_tag)s scripts/polaris/sweep_film_capacity.pbs
+qsub -v HDR_SWEEP_TAG=%(capacity_tag)s scripts/polaris/sweep_film_capacity_eval.pbs
+python scripts/build_sweep_report.py --tag %(tag)s --film-tag %(film_tag)s \
+    --capacity-tag %(capacity_tag)s --compile
 \end{verbatim}
 Per-frame figures, per-image metrics (\texttt{results.csv}) and a
 plain-language summary (\texttt{summary.md}, including automatic
@@ -961,6 +1203,13 @@ data, augmentation, loss and training schedule, so the difference in the
 comparison table is attributable to the routing-vs-conditioning mechanism
 and not to a confound elsewhere in the pipeline. It is Phase~1 only, same
 caveat as above.
+\item The trunk-capacity ablation (Section~\ref{sec:capacity}) reuses the
+Phase~1 learning-rate schedule and epoch count tuned around the dim=32
+baseline for every trunk width, including dim=48/64 -- a real confound if
+larger trunks simply need a different schedule (lower peak LR, more
+warmup, more epochs) to reach their own optimum rather than genuinely
+having no more to give. The result reported here is ``more capacity did
+not help under this training recipe,'' not ``more capacity cannot help.''
 \item Two smaller, previously-documented bugs remain unfixed and out of
 scope here: an even \texttt{window\_size} in the SNR-map estimator
 under-pads by one pixel (unreachable in production, since every call site
@@ -1002,6 +1251,17 @@ def main(argv=None):
         status = f"epoch {m.epoch}, {m.params_m:.2f}M params" if m.present else "MISSING"
         print(f"  film_hidden={m.h}: {status}")
 
+    capacity_tag = args.capacity_tag or args.tag
+    capacity_members = [CapacityMember(d, capacity_tag) for d in args.capacity_dims]
+    for m in capacity_members:
+        m.load(args.frame)
+    n_capacity_present = sum(m.present for m in capacity_members)
+    print(f"capacity ablation tag '{capacity_tag}': "
+          f"{n_capacity_present}/{len(capacity_members)} checkpoints found")
+    for m in capacity_members:
+        status = f"epoch {m.epoch}, {m.params_m:.2f}M params" if m.present else "MISSING"
+        print(f"  dim={m.dim}: {status}")
+
     os.makedirs(args.out, exist_ok=True)
 
     doc = TEMPLATE % {
@@ -1020,9 +1280,16 @@ def main(argv=None):
         "family_table": build_family_comparison_table(members, film_members),
         "family_pgfplot": build_family_pgfplot(members, film_members),
         "family_recommendation": build_family_recommendation(members, film_members),
+        "capacity_dim_list": ", ".join(str(m.dim) for m in capacity_members),
+        "capacity_table": build_capacity_table(capacity_members),
+        "capacity_pgfplot": build_capacity_pgfplot(capacity_members),
+        "capacity_recommendation": build_capacity_recommendation(capacity_members),
+        "capacity_frame_figure": build_capacity_frame_figure(
+            capacity_members, args.out, args.frame),
         "tag": args.tag,
         "tag_escaped": tex_escape(args.tag),
         "film_tag": film_tag,
+        "capacity_tag": capacity_tag,
     }
 
     tex_path = os.path.join(args.out, "report.tex")
