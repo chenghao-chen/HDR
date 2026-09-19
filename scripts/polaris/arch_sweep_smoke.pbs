@@ -1,0 +1,106 @@
+#!/bin/bash -l
+#PBS -N hdr_arch_smoke
+#PBS -A lighthouse-purdue
+#PBS -q debug-scaling
+#PBS -l select=2:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Rehearsal for arch_sweep.pbs: the same launcher, the same worker, the same
+# manifest format, on two nodes for one epoch.
+#
+#   qsub -v HDR_SWEEP_MANIFEST=sweep_manifest.csv scripts/polaris/arch_sweep_smoke.pbs
+#
+# The full sweep is twenty nodes for three hours, and every way it can fail
+# for a silly reason — a launcher flag Polaris does not take, a GPU pinned
+# wrong, an environment variable that never reaches the trainer, a degenerate
+# model that NaNs at width 2 — fails identically here for a few node-minutes.
+#
+# It takes the eight ranks spread across the manifest rather than its first
+# eight, so both ends of the size ladder are exercised: the narrowest models
+# are the ones at risk of collapsing, and the widest are the ones at risk of
+# running out of memory or time.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+FULL_MANIFEST="${HDR_SWEEP_MANIFEST:-sweep_manifest.csv}"
+MANIFEST="logs/arch_smoke_manifest_${PBS_JOBID:-interactive}.csv"
+STATUS_DIR="logs/arch_smoke_status_${PBS_JOBID:-interactive}"
+WORKER="scripts/polaris/arch_sweep_worker.sh"
+NRANKS=8
+
+[[ -f "$FULL_MANIFEST" ]] || hdr::die "manifest not found: $FULL_MANIFEST"
+
+TOTAL=$(( $(wc -l < "$FULL_MANIFEST") - 1 ))
+(( TOTAL > 0 )) || hdr::die "manifest $FULL_MANIFEST has no data rows"
+
+# Evenly spaced picks spanning the manifest endpoints inclusive. Both ends
+# matter: the first row is the narrowest model, which is the one at risk of
+# collapsing, and the last is the widest, which is the one at risk of running
+# out of memory or overrunning the walltime.
+hdr::log "sampling $NRANKS of $TOTAL runs, spanning both ends of the ladder"
+{
+    head -n 1 "$FULL_MANIFEST"
+    for (( i = 0; i < NRANKS; i++ )); do
+        if (( NRANKS > 1 )); then
+            row=$(( 1 + i * (TOTAL - 1) / (NRANKS - 1) ))
+        else
+            row=1
+        fi
+        sed -n "$(( row + 1 ))p" "$FULL_MANIFEST"
+    done
+} > "$MANIFEST"
+
+mkdir -p "$STATUS_DIR" logs
+chmod +x "$WORKER"
+
+export HDR_SWEEP_MANIFEST="$MANIFEST"
+export HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+# One epoch is enough to prove the path end to end: model builds, data loads,
+# a step runs, a checkpoint is written.
+export HDR_NUM_EPOCHS="${HDR_SMOKE_EPOCHS:-1}"
+# Keep the rehearsal's checkpoints out of the real sweep's folders, so the
+# real run starts from scratch rather than resuming a one-epoch checkpoint.
+export HDR_SWEEP_FOLDER_SUFFIX="_smoke"
+
+hdr::rule
+hdr::log "runs in this rehearsal:"
+tail -n +2 "$MANIFEST" | cut -d, -f1,4,6,7,8,9,10 | sed 's/^/  /'
+hdr::rule
+
+mpiexec -n "$NRANKS" --ppn 4 --depth=8 --cpu-bind depth "./$WORKER"
+launch_rc=$?
+
+hdr::head
+hdr::log "mpiexec returned : $launch_rc"
+
+ok=0; bad=0
+while IFS=',' read -r run _rest; do
+    [[ "$run" == "run" ]] && continue
+    sfile="$STATUS_DIR/${run}.status"
+    state="NO STATUS"
+    [[ -f "$sfile" ]] && state="$(< "$sfile")"
+    hdr::log "  $run : $state"
+    if [[ "$state" == "OK" ]]; then
+        ok=$(( ok + 1 ))
+    else
+        bad=$(( bad + 1 ))
+    fi
+done < "$MANIFEST"
+
+hdr::log "ok=$ok  bad=$bad  (of $NRANKS)"
+hdr::log "checkpoints written under models_arch_*/ — delete before the real sweep"
+hdr::head
+
+(( bad == 0 )) && exit 0
+exit 1

@@ -1,0 +1,81 @@
+#!/bin/bash -l
+#PBS -N hdr_arch_sweep_eval
+#PBS -A lighthouse-purdue
+#PBS -q prod
+#PBS -l select=20:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Benchmark every checkpoint the architecture sweep produced, one per GPU.
+#
+#   qsub -v HDR_SWEEP_MANIFEST=sweep_manifest.csv scripts/polaris/arch_sweep_eval.pbs
+#
+# Companion to arch_sweep.pbs: same manifest, same rank-to-run mapping, so it
+# reads <folder>/phase1_best.pth for each row and writes test_results/<folder>/
+# and test_visuals/<folder>/.
+#
+# A missing checkpoint is reported, not fatal — a sweep where a few arms failed
+# to train should still yield results for the ones that did.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+MANIFEST="${HDR_SWEEP_MANIFEST:-sweep_manifest.csv}"
+STATUS_DIR="logs/arch_eval_status_${PBS_JOBID:-interactive}"
+WORKER="scripts/polaris/arch_sweep_eval_worker.sh"
+
+[[ -f "$MANIFEST" ]] || hdr::die "manifest not found: $MANIFEST"
+
+NRUNS=$(( $(wc -l < "$MANIFEST") - 1 ))
+NNODES=$(wc -l < "${PBS_NODEFILE:-/dev/null}" 2>/dev/null || echo 0)
+CAPACITY=$(( NNODES * 4 ))
+
+hdr::log "manifest : $MANIFEST  ($NRUNS runs)"
+hdr::log "nodes    : $NNODES  (capacity ${CAPACITY} GPUs)"
+(( NRUNS > CAPACITY )) && hdr::die \
+    "manifest has $NRUNS runs but the allocation only holds $CAPACITY."
+
+mkdir -p "$STATUS_DIR" logs
+chmod +x "$WORKER"
+
+export HDR_SWEEP_MANIFEST="$MANIFEST"
+export HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+
+hdr::rule
+hdr::log "evaluating $NRUNS checkpoints, 4 per node"
+hdr::rule
+
+mpiexec -n "$NRUNS" --ppn 4 --depth=8 --cpu-bind depth "./$WORKER"
+launch_rc=$?
+
+hdr::head
+hdr::log "mpiexec returned : $launch_rc"
+
+ok=0; bad=0; skipped=0
+while IFS=',' read -r run _rest; do
+    [[ "$run" == "run" ]] && continue
+    sfile="$STATUS_DIR/${run}.status"
+    state="NO STATUS"
+    [[ -f "$sfile" ]] && state="$(< "$sfile")"
+    case "$state" in
+        OK)      ok=$(( ok + 1 )) ;;
+        SKIPPED) skipped=$(( skipped + 1 )); hdr::log "  $run : no checkpoint" ;;
+        *)       bad=$(( bad + 1 ));        hdr::log "  $run : $state" ;;
+    esac
+done < "$MANIFEST"
+
+hdr::log "ok=$ok  failed=$bad  skipped=$skipped  (of $NRUNS)"
+hdr::log "results : test_results/models_arch_*/"
+hdr::head
+
+(( bad == 0 )) && exit 0
+exit 1

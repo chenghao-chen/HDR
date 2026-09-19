@@ -41,6 +41,8 @@ jobs:
   sweep_film_eval    eval companion to sweep_film                (debug queue, 30 min)
   sweep_film_capacity      trunk dim in {16,32,48,64}, parallel        (debug queue, 1 h)
   sweep_film_capacity_eval eval companion to sweep_film_capacity       (debug queue, 30 min)
+  arch_sweep         every arm x every param budget, 1 run/GPU   (prod/small, 20 nodes, 3 h)
+  arch_sweep_smoke   2-node rehearsal of arch_sweep, 1 epoch     (debug-scaling, 1 h)
 
 options:
   --site NAME   submit the scripts for NAME instead of the detected machine.

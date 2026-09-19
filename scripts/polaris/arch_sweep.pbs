@@ -1,0 +1,104 @@
+#!/bin/bash -l
+#PBS -N hdr_arch_sweep
+#PBS -A lighthouse-purdue
+#PBS -q prod
+#PBS -l select=20:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=02:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# The architecture sweep: every arm at every parameter budget, one run per GPU,
+# all of them at once.
+#
+#   python scripts/solve_param_grid.py --tag arch --out sweep_manifest.csv
+#   qsub -v HDR_SWEEP_MANIFEST=sweep_manifest.csv scripts/polaris/arch_sweep.pbs
+#
+# The manifest decides how many ranks launch, so regenerating it with a
+# different ladder or arm list changes the sweep without editing this file —
+# but `select=` above has to be changed to match, because PBS cannot size the
+# allocation from a file it has not read yet. The preflight below refuses to
+# launch when the two disagree rather than silently running a partial sweep.
+#
+# Queue note: prod routes on node count, and 10-24 nodes lands in `small`,
+# whose ceiling is three hours. Phase-1 training is ~50 minutes at the 20M
+# baseline and less below it, so the whole sweep fits one allocation with
+# room to spare. Nothing here resumes: at this width a preempted or truncated
+# run is cheaper to re-run than to checkpoint around.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+MANIFEST="${HDR_SWEEP_MANIFEST:-sweep_manifest.csv}"
+STATUS_DIR="logs/arch_status_${PBS_JOBID:-interactive}"
+WORKER="scripts/polaris/arch_sweep_worker.sh"
+
+if [[ ! -f "$MANIFEST" ]]; then
+    hdr::die "manifest not found: $MANIFEST
+Generate it first:  python scripts/solve_param_grid.py --out $MANIFEST"
+fi
+
+NRUNS=$(( $(wc -l < "$MANIFEST") - 1 ))
+NNODES=$(wc -l < "${PBS_NODEFILE:-/dev/null}" 2>/dev/null || echo 0)
+CAPACITY=$(( NNODES * 4 ))
+
+hdr::log "manifest : $MANIFEST  ($NRUNS runs)"
+hdr::log "nodes    : $NNODES  (capacity ${CAPACITY} GPUs)"
+
+if (( NRUNS > CAPACITY )); then
+    hdr::die "manifest has $NRUNS runs but the allocation only holds $CAPACITY.
+Either shrink the manifest or raise 'select=' in this script."
+fi
+if (( NRUNS < CAPACITY )); then
+    hdr::warn "$(( CAPACITY - NRUNS )) GPU(s) will sit idle — allocation is larger than the sweep."
+fi
+
+mkdir -p "$STATUS_DIR" logs
+chmod +x "$WORKER"
+
+export HDR_SWEEP_MANIFEST="$MANIFEST"
+export HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+
+hdr::rule
+hdr::log "launching $NRUNS ranks, 4 per node"
+hdr::rule
+
+# --depth=8 --cpu-bind depth gives each of the four ranks its own eight
+# physical cores; without it they all land on the same core set and the
+# dataloaders fight each other.
+mpiexec -n "$NRUNS" --ppn 4 --depth=8 --cpu-bind depth "./$WORKER"
+launch_rc=$?
+
+hdr::head
+hdr::log "mpiexec returned  : $launch_rc"
+hdr::log "run results:"
+
+ok=0; failed=0; missing=0
+while IFS=',' read -r run _rest; do
+    [[ "$run" == "run" ]] && continue
+    sfile="$STATUS_DIR/${run}.status"
+    if [[ ! -f "$sfile" ]]; then
+        hdr::log "  $run : NO STATUS (rank never finished)"
+        missing=$(( missing + 1 ))
+    elif [[ "$(< "$sfile")" == "OK" ]]; then
+        ok=$(( ok + 1 ))
+    else
+        hdr::log "  $run : $(< "$sfile")"
+        failed=$(( failed + 1 ))
+    fi
+done < "$MANIFEST"
+
+hdr::log "ok=$ok  failed=$failed  missing=$missing  (of $NRUNS)"
+hdr::log "per-run logs     : logs/${PBS_JOBID:-interactive}_arch_*.log"
+hdr::log "sweep finished   : $(date)"
+hdr::head
+
+(( failed == 0 && missing == 0 )) && exit 0
+exit 1
