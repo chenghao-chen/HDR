@@ -40,6 +40,11 @@ export CUDA_VISIBLE_DEVICES="$LOCAL_RANK"
 export HDR_CHECKPOINT="$CKPT"
 export OMP_NUM_THREADS="${HDR_SWEEP_OMP_THREADS:-8}"
 
+# Same AF_UNIX guard as the training worker: PBS hands out a long
+# job-specific TMPDIR on some queues, and the dataloader's Unix socket
+# path overflows the ~108-byte limit the moment it spawns workers.
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+
 source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
 hdr::init >/dev/null 2>&1
 

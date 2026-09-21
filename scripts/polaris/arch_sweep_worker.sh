@@ -66,6 +66,13 @@ export WANDB_MODE=offline
 export OMP_NUM_THREADS="${HDR_SWEEP_OMP_THREADS:-8}"
 export HDR_DATALOADER_WORKERS="${HDR_SWEEP_WORKERS:-4}"
 
+# The dataloader's worker processes bind a Unix domain socket under TMPDIR,
+# and AF_UNIX addresses cap at ~108 bytes. PBS hands out a long job-specific
+# TMPDIR on some queues, which overflows that limit the moment the loader
+# spawns workers -- the model builds and the dataset opens, then it dies
+# with "AF_UNIX path too long". A short TMPDIR keeps the socket in bounds.
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+
 source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
 hdr::init >/dev/null 2>&1
 
