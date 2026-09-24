@@ -509,6 +509,153 @@ class MoEDenoiser(nn.Module):
         return blended, expert_outs, gates
 
 
+class FiLMGenerator(nn.Module):
+    """
+    Predicts per-pixel (gamma, beta) to affine-modulate the shared trunk's
+    output features, conditioned on the raw noisy BGGR input and the local
+    SNR map -- the same two signals NoiseGate sees, but producing a
+    continuous per-pixel transform of a SINGLE decoder's features instead
+    of a discrete softmax weighting over K decoders.
+
+    Why this exists: the num-experts sweep (see BENCHMARKING.md / the
+    project's sweep report) found the K-expert MoE barely benefits from
+    more experts -- per-expert PSNR spread stayed under 0.11 dB at every K
+    tested, and three measured reasons point at the mechanism rather than
+    at K being mistuned: (1) each expert head is ~150K params against a
+    ~20M-param trunk, too thin to encode a different function regardless
+    of routing; (2) local SNR correlates r=0.37-0.88 with raw pixel
+    brightness on real training crops -- much of what the gate routes on
+    is already inferable by the trunk without an explicit branch; (3) SNR
+    varies ~3x more ACROSS training crops than WITHIN one, which a
+    per-pixel router acting on a single crop cannot exploit anyway. FiLM
+    replaces hard K-way routing with continuous per-pixel conditioning of
+    one head, using the same (x, snr_map) signal, to test whether the
+    routing mechanism itself -- not the expert count -- was the mismatch.
+
+    The final conv is initialised small (std 1e-3, zero bias) rather than
+    exactly zero: an exactly-zero head is a documented trap in this file
+    (see NoiseGate) -- it makes the transform identically the identity,
+    which is what we want at step 0, but also makes d(gamma,beta)/d(hidden)
+    exactly zero, freezing the two hidden convs. Small-but-nonzero keeps
+    the transform near-identity at init while remaining trainable.
+    """
+
+    def __init__(self, feat_channels, in_channels=5, hidden=16):
+        super().__init__()
+        self.feat_channels = feat_channels
+        self.unshuffle = nn.PixelUnshuffle(2)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels * 4, hidden, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, feat_channels * 2, kernel_size=1),
+        )
+        nn.init.normal_(self.net[-1].weight, std=1e-3)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x, snr_map):
+        z = self.unshuffle(torch.cat([x, snr_map], dim=1))  # [B, 20, H/2, W/2]
+        gamma, beta = self.net(z).split(self.feat_channels, dim=1)
+        return gamma, beta
+
+
+class FiLMDenoiser(nn.Module):
+    """
+    Single-decoder alternative to MoEDenoiser: the identical shared trunk,
+    but noise-adaptive behaviour comes from continuously modulating the
+    trunk's features (FiLM: per-pixel scale + shift, conditioned on the raw
+    input and local SNR map) rather than from blending K discrete expert
+    heads. See FiLMGenerator's docstring for why.
+
+    forward(x, snr_map) -> (blended, expert_outs, gates) matches
+    MoEDenoiser's contract exactly, with K=1, so the eval/visualisation
+    harness (built around an expert axis and a gate) works unmodified --
+    expert_outs is the single head's output with a size-1 expert axis, and
+    gates is an all-ones size-1 tensor (a "gate" that always fully selects
+    the only "expert" is the honest way to represent no routing at all in
+    that same contract, not a stand-in for real routing).
+    """
+
+    def __init__(self, out_channels=3, dim=32, num_blocks=(4, 4, 4, 4),
+                 num_refinement_blocks=4, heads=(1, 2, 4, 8), se_reduction=8,
+                 expert_blocks=2, film_hidden=16):
+        super().__init__()
+        del num_refinement_blocks   # lives inside the head
+        self.dim = dim
+        self.num_experts = 1        # contract compatibility with MoEDenoiser
+
+        # ======== Shared trunk (identical topology to MoEDenoiser) ========
+        self.bayer_unshuffle = nn.PixelUnshuffle(2)
+        self.patch_embed = nn.Conv2d(16, dim, kernel_size=3, stride=1, padding=1)
+
+        self.encoder_level_1 = nn.Sequential(*[
+            ResidualConvBlock(dim, se_reduction) for _ in range(num_blocks[0])
+        ])
+        self.x_expo_1 = HeavyExposhare(dim)
+
+        self.down_unshuffle_1_2 = nn.PixelUnshuffle(2)
+        self.encoder_level_2 = nn.Sequential(*[
+            ResidualConvBlock(dim * 4, se_reduction) for _ in range(num_blocks[1])
+        ])
+        self.x_expo_2 = HeavyExposhare(dim * 4)
+
+        self.down_unshuffle_2_3 = nn.PixelUnshuffle(2)
+        self.latent = nn.Sequential(*[
+            RestormerBlock(dim=dim * 16, num_heads=heads[3])
+            for _ in range(num_blocks[3])
+        ])
+        self.latent_fusion = nn.Conv2d(dim * 16, dim * 16, kernel_size=1)
+
+        self.up_shuffle_3_2 = nn.PixelShuffle(2)
+        self.decoder_level_2 = nn.Sequential(*[
+            ResidualConvBlock(dim * 8, se_reduction) for _ in range(num_blocks[2])
+        ])
+        self.reduce_chan_level_2 = nn.Conv2d(dim * 8, dim * 4, kernel_size=1)
+
+        self.up_shuffle_2_1 = nn.PixelShuffle(2)
+        self.decoder_level_1 = nn.Sequential(*[
+            ResidualConvBlock(dim * 2, se_reduction) for _ in range(num_blocks[0])
+        ])
+        # Trunk output: [B, dim*2, H/2, W/2]
+
+        # ======== FiLM conditioning + single head ========
+        self.film = FiLMGenerator(dim * 2, in_channels=5, hidden=film_hidden)
+        self.head = ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction)
+
+    def _trunk(self, x):
+        x_level1 = self.patch_embed(self.bayer_unshuffle(x))
+        x_level1 = self.x_expo_1(self.encoder_level_1(x_level1))
+
+        x_level2 = self.down_unshuffle_1_2(x_level1)
+        x_level2 = self.x_expo_2(self.encoder_level_2(x_level2))
+
+        x_latent = self.down_unshuffle_2_3(x_level2)
+        x_latent = self.latent_fusion(self.latent(x_latent))
+
+        w_level2 = torch.cat([self.up_shuffle_3_2(x_latent), x_level2], dim=1)
+        w_level2 = self.reduce_chan_level_2(self.decoder_level_2(w_level2))
+
+        w_level1 = torch.cat([self.up_shuffle_2_1(w_level2), x_level1], dim=1)
+        return self.decoder_level_1(w_level1)          # [B, dim*2, H/2, W/2]
+
+    def forward(self, x, snr_map):
+        feat = self._trunk(x)                          # [B, dim*2, H/2, W/2]
+
+        gamma, beta = self.film(x, snr_map)             # each [B, dim*2, H/2, W/2]
+        feat = feat * (1.0 + gamma) + beta
+
+        out = self.head(feat).clamp(min=_CLAMP_EPS)     # [B, 3, 2H, 2W]
+        expert_outs = out.unsqueeze(1)                  # [B, 1, 3, 2H, 2W]
+        gates = torch.ones_like(out[:, :1])              # [B, 1, 2H, 2W]
+
+        if not self.training:
+            out         = out.clamp(max=1.0)
+            expert_outs = expert_outs.clamp(max=1.0)
+
+        return out, expert_outs, gates
+
+
 # ---------------------------------------------------------
 # 4. Legacy wrappers (unified return signature)
 # ---------------------------------------------------------
@@ -559,13 +706,19 @@ class SingleDenoiser(nn.Module):
         return out, out.unsqueeze(1), gates
 
 
-def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16, **kwargs):
+def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16,
+                   film_hidden=16, **kwargs):
     """
     Factory shared by the train and test scripts.
     mode: "moe" (shared trunk + K light experts)  |  "dual"  |  "single"
+        | "film" (shared trunk + one head, continuously modulated by a
+          per-pixel FiLM transform instead of routed)
     kwargs are forwarded to the underlying model(s):
         out_channels, dim, num_blocks, num_refinement_blocks, heads,
         se_reduction (None for legacy pre-SE checkpoints).
+    num_experts is accepted for every mode (the training script always
+    passes it) but only "moe" uses it; the rest ignore it, same as they
+    already ignore expert_blocks/gate_hidden.
     """
     mode = mode.lower()
     if mode == "moe":
@@ -575,4 +728,8 @@ def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16, **kwarg
         return DualSNRDenoiser(**kwargs)
     if mode == "single":
         return SingleDenoiser(**kwargs)
-    raise ValueError(f"Unknown denoiser mode '{mode}' (use moe | dual | single)")
+    if mode == "film":
+        return FiLMDenoiser(expert_blocks=expert_blocks, film_hidden=film_hidden,
+                            **kwargs)
+    raise ValueError(
+        f"Unknown denoiser mode '{mode}' (use moe | dual | single | film)")

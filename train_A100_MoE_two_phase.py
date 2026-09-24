@@ -36,11 +36,15 @@ Usage
             the Phase 1 run.  Phase 2 auto-loads it if no Phase 2 checkpoint
             exists in the current save folder.
 
-  HDR_MODE / HDR_NUM_EXPERTS / HDR_DATALOADER_WORKERS override MODE /
-  NUM_EXPERTS / the dataloader worker count, same pattern as HDR_SAVE_FOLDER.
+  HDR_MODE / HDR_NUM_EXPERTS / HDR_FILM_HIDDEN / HDR_DIM / HDR_NUM_BLOCKS /
+  HDR_EXPERT_BLOCKS / HDR_DATALOADER_WORKERS override MODE / NUM_EXPERTS / the
+  FiLM generator width / the shared trunk width / the trunk depth per level /
+  the expert head depth / the dataloader worker count, same pattern as
+  HDR_SAVE_FOLDER.
   Meant for launching several configurations in parallel, one process per GPU
   on a node, each with CUDA_VISIBLE_DEVICES pinned to a different device and
-  its own HDR_SAVE_FOLDER — see scripts/polaris/sweep_experts.pbs.
+  its own HDR_SAVE_FOLDER — see scripts/polaris/sweep_experts.pbs,
+  scripts/polaris/sweep_film.pbs, scripts/polaris/sweep_film_capacity.pbs.
 
 D4 augmentation for BGGR packed Bayer
 ──────────────────────────────────────
@@ -266,8 +270,16 @@ if __name__ == "__main__":
     # per GPU on a node — without editing this file per run. Plain literals
     # still work for the single-run case; os.environ.get falls through to
     # them when the variable is unset.
-    MODE        = os.environ.get("HDR_MODE", "moe")            # "moe" | "dual" | "single"
+    MODE        = os.environ.get("HDR_MODE", "moe")            # "moe" | "dual" | "single" | "film"
     NUM_EXPERTS = int(os.environ.get("HDR_NUM_EXPERTS", "2"))  # MoE only
+    FILM_HIDDEN = int(os.environ.get("HDR_FILM_HIDDEN", "16")) # film only
+    TRUNK_DIM   = int(os.environ.get("HDR_DIM", "32"))         # shared trunk width
+    # Trunk depth per U-Net level. "4" expands to [4,4,4,4]; a comma list
+    # ("4,4,6,8") sets each level independently.
+    _nb_raw     = os.environ.get("HDR_NUM_BLOCKS", "4")
+    NUM_BLOCKS  = ([int(v) for v in _nb_raw.split(",")] if "," in _nb_raw
+                   else [int(_nb_raw)] * 4)
+    EXPERT_BLOCKS = int(os.environ.get("HDR_EXPERT_BLOCKS", "2"))
     USE_COMPILE = False    # torch.compile the model (A100 speedup; needs
                            # stable torch+inductor on the cluster)
 
@@ -335,6 +347,15 @@ if __name__ == "__main__":
         rollback_mult  = 5.0
         LPIPS_CROP     = 256
 
+    # A rehearsal run wants the full code path on a fraction of the epochs, so
+    # that a launcher or plumbing bug surfaces in minutes rather than after a
+    # full allocation. Warmup is clamped below the epoch count too, or a short
+    # run would spend all of itself ramping the learning rate.
+    _epochs_override = os.environ.get("HDR_NUM_EPOCHS")
+    if _epochs_override:
+        num_epochs    = int(_epochs_override)
+        warmup_epochs = min(warmup_epochs, max(num_epochs - 1, 0))
+
     # Shared loss weights
     mu             = 5000   # µ-law tonemapping constant (HDR literature standard)
     aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
@@ -356,12 +377,24 @@ if __name__ == "__main__":
     last_epoch_psnr_mu, last_epoch_loss = 0.0, 1e6
 
     model_kwargs = {
-        "dim":                  32,
-        "num_blocks":           [4, 4, 4, 4],
+        "dim":                  TRUNK_DIM,
+        "num_blocks":           NUM_BLOCKS,
         "num_refinement_blocks": 4,
         "heads":                [1, 2, 4, 8],
         "se_reduction":         8,
+        # In model_kwargs, not alongside it, for the same round-trip reason as
+        # film_hidden below: build_denoiser takes expert_blocks as a named
+        # parameter for every mode, so the checkpoint rebuilds the exact head
+        # depth instead of silently falling back to the default of 2.
+        "expert_blocks":        EXPERT_BLOCKS,
     }
+    if MODE == "film":
+        # Stored in model_kwargs (not passed alongside it) so it round-trips
+        # through the checkpoint: load_model_from_checkpoint rebuilds the
+        # architecture from the saved model_kwargs alone, and build_denoiser
+        # consumes film_hidden as a named parameter regardless of mode, so
+        # this is a safe no-op for every other mode.
+        model_kwargs["film_hidden"] = FILM_HIDDEN
 
     # ── W&B ───────────────────────────────────────────────────────────
     wandb.init(

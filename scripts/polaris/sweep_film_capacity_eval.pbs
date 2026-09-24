@@ -1,0 +1,83 @@
+#!/bin/bash -l
+#PBS -N hdr_sweep_film_capacity_eval
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Evaluate the trunk-capacity ablation — benchmark + per-frame visuals for
+# dim in {16,32,48,64} (film_hidden fixed at 16), one checkpoint per GPU, in
+# parallel.
+#
+#   qsub -v HDR_SWEEP_TAG=colorfix scripts/polaris/sweep_film_capacity_eval.pbs
+#
+# Companion to sweep_film_capacity.pbs: same tag, same dims, reads
+# models_p1_film_D{D}_<tag>_polaris/phase1_best.pth and writes
+# test_results/models_p1_film_D{D}_<tag>_polaris/ and
+# test_visuals/models_p1_film_D{D}_<tag>_polaris/ for each.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+hdr::preflight || hdr::warn "continuing despite check failures"
+
+TAG="${HDR_SWEEP_TAG:-sweep}"
+DIMS=(16 32 48 64)
+PIDS=()
+
+for i in "${!DIMS[@]}"; do
+    D="${DIMS[$i]}"
+    CKPT="models_p1_film_D${D}_${TAG}_polaris/phase1_best.pth"
+    LOG="logs/${PBS_JOBID:-interactive}_film_capacity_eval_D${D}.log"
+
+    if [[ ! -f "$CKPT" ]]; then
+        hdr::log "dim=${D}: SKIPPED — no checkpoint at ${CKPT}"
+        PIDS+=(0)
+        continue
+    fi
+
+    hdr::log "evaluating dim=${D} on GPU ${i} -> ${CKPT}  (log: ${LOG})"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_CHECKPOINT="$CKPT"
+        "$HDR_PYTHON" test_dual_MoE_two_phase.py \
+            && "$HDR_PYTHON" scripts/save_test_outputs.py --checkpoint "$CKPT"
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on evaluation runs: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!DIMS[@]}"; do
+    D="${DIMS[$i]}"
+    pid="${PIDS[$i]}"
+    if [[ "$pid" == "0" ]]; then
+        status=1
+        continue
+    fi
+    if wait "$pid"; then
+        hdr::log "dim=${D} (pid ${pid}): OK"
+    else
+        code=$?
+        hdr::log "dim=${D} (pid ${pid}): FAILED (exit $code)"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "eval sweep finished : $(date)"
+hdr::log "overall status       : $status"
+hdr::head
+exit $status
