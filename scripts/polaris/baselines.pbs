@@ -1,0 +1,76 @@
+#!/bin/bash -l
+#PBS -N hdr_baselines
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# The comparison this project has never actually run: our trained models
+# against the classical denoise+demosaic lineup, on the same test split,
+# through the same inference path and the same metrics.
+#
+#   qsub scripts/polaris/baselines.pbs
+#
+# Only classical baselines appear here. The learned ones (dncnn, unet,
+# demosaicnet, restormer_lite) ship untrained, so running them now would
+# score noise rather than a method -- they need their own training job at
+# matched parameter budgets before they mean anything.
+#
+# Three checkpoints span the capacity ladder rather than only the best one,
+# so the table shows where our models sit against the classical floor as a
+# function of size, not just at the top.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+
+OUT="test_results/baseline_comparison"
+mkdir -p "$OUT"
+
+CKPTS=(
+    "moe20.7M=models_arch_20p7M_moeK2_arch_polaris/phase1_best.pth"
+    "moe1.3M=models_arch_1p3M_moeK2_arch_polaris/phase1_best.pth"
+    "moe345k=models_arch_345k_moeK2_arch_polaris/phase1_best.pth"
+)
+
+ARGS=()
+for c in "${CKPTS[@]}"; do
+    path="${c#*=}"
+    if [[ -f "$path" ]]; then
+        ARGS+=(--checkpoint "$c")
+        hdr::log "including ${c%%=*}"
+    else
+        hdr::warn "missing checkpoint, skipping: $path"
+    fi
+done
+
+hdr::rule
+hdr::log "running classical baselines + ${#ARGS[@]} checkpoint flags"
+hdr::rule
+
+"$HDR_PYTHON" -m hdr_eval.cli \
+    --dataset mobile_hdr --split test \
+    "${ARGS[@]}" \
+    --baselines gbtf,malvar,bilinear,wavelet+gbtf,vst_wavelet+gbtf,nlm+gbtf,wavelet+gbtf_post \
+    --reference gbtf \
+    --inference tiled --tile 512 \
+    --ms-ssim \
+    --out "$OUT"
+rc=$?
+
+hdr::head
+hdr::log "exit           : $rc"
+hdr::log "results        : $OUT/report.md"
+hdr::head
+exit $rc

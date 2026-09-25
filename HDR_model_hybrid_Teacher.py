@@ -366,8 +366,19 @@ class ExpertHead(nn.Module):
     positive bias puts essentially all of them above it.
     See tests/test_model_moe.py::test_fresh_model_produces_nonzero_gradients.
     """
-    def __init__(self, in_dim, out_channels=3, num_blocks=2, se_reduction=8):
+    def __init__(self, in_dim, out_channels=3, num_blocks=2, se_reduction=8,
+                 upsample=True):
+        """
+        upsample
+            True  -> (out_channels, 2H, 2W), sensor resolution. The second
+                     PixelShuffle is the demosaicing step, so this is the
+                     joint denoise+demosaic head.
+            False -> (out_channels, H, W), packed Bayer resolution: a
+                     denoise-only head that leaves the mosaic intact, which
+                     is what a RAW->RAW benchmark such as SIDD scores.
+        """
         super().__init__()
+        self.upsample = bool(upsample)
         self.blocks = nn.Sequential(*[
             ResidualConvBlock(in_dim, se_reduction) for _ in range(num_blocks)
         ])
@@ -376,9 +387,11 @@ class ExpertHead(nn.Module):
         self.refine1 = nn.Conv2d(r, r, kernel_size=3, padding=1)
         self.act = nn.GELU()
         self.refine2 = nn.Conv2d(r, r, kernel_size=3, padding=1)
-        # Maps r channels -> out_channels*4 for the second PixelShuffle(2)
-        self.proj_out = nn.Conv2d(r, out_channels * 4, kernel_size=1)
-        self.up2 = nn.PixelShuffle(2)                 # -> (out_channels, 2H, 2W)
+        # With upsample, proj_out feeds PixelShuffle(2) and so needs 4x the
+        # channels; without it, it projects straight to the output.
+        fan = 4 if self.upsample else 1
+        self.proj_out = nn.Conv2d(r, out_channels * fan, kernel_size=1)
+        self.up2 = nn.PixelShuffle(2) if self.upsample else nn.Identity()
         nn.init.normal_(self.proj_out.weight, std=1e-3)
         nn.init.constant_(self.proj_out.bias, _INIT_OUT_LEVEL)
 
@@ -387,7 +400,7 @@ class ExpertHead(nn.Module):
         z = self.up(z)                                # (B, r, H, W)  — packed Bayer res
         z = self.act(self.refine1(z))
         z = self.refine2(z)
-        return self.up2(self.proj_out(z))             # (B, out_channels, 2H, 2W)  — sensor res
+        return self.up2(self.proj_out(z))
 
 
 class MoEDenoiser(nn.Module):
@@ -413,11 +426,15 @@ class MoEDenoiser(nn.Module):
     """
     def __init__(self, out_channels=3, dim=32, num_blocks=(4, 4, 4, 4),
                  num_refinement_blocks=4, heads=(1, 2, 4, 8), se_reduction=8,
-                 num_experts=3, expert_blocks=2, gate_hidden=16):
+                 num_experts=3, expert_blocks=2, gate_hidden=16, upsample=True):
         super().__init__()
         del num_refinement_blocks   # lives inside the expert heads
         self.dim = dim
         self.num_experts = num_experts
+        # upsample=False turns this into a denoise-only RAW->RAW model: the
+        # heads stop at packed Bayer resolution and the gate is used there
+        # directly instead of being upsampled to sensor resolution.
+        self.upsample = bool(upsample)
 
         # ======== Shared trunk (same topology as the teacher through decoder_level_1) ========
         self.bayer_unshuffle = nn.PixelUnshuffle(2)
@@ -455,7 +472,8 @@ class MoEDenoiser(nn.Module):
 
         # ======== Experts + gate ========
         self.experts = nn.ModuleList([
-            ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction)
+            ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction,
+                       upsample=self.upsample)
             for _ in range(num_experts)
         ])
         # Break the symmetry between otherwise-identical expert heads (see
@@ -495,10 +513,13 @@ class MoEDenoiser(nn.Module):
             [head(feat).clamp(min=_CLAMP_EPS) for head in self.experts],
             dim=1)                                     # [B, K, 3, 2H, 2W]
 
-        # Gate at packed Bayer resolution, then bilinearly upsample to sensor res
-        gates_lr = self.gate(x, snr_map)              # [B, K, H, W]
-        gates = F.interpolate(gates_lr, scale_factor=2.0,
-                              mode='bilinear', align_corners=False)  # [B, K, 2H, 2W]
+        # Gate is produced at packed Bayer resolution. It only needs the 2x
+        # bilinear upsample when the heads upsampled too; in RAW->RAW mode
+        # gate and expert outputs already agree.
+        gates = self.gate(x, snr_map)                 # [B, K, H, W]
+        if self.upsample:
+            gates = F.interpolate(gates, scale_factor=2.0,
+                                  mode='bilinear', align_corners=False)
 
         blended = (gates.unsqueeze(2) * expert_outs).sum(dim=1)    # [B, 3, 2H, 2W]
 
@@ -579,11 +600,13 @@ class FiLMDenoiser(nn.Module):
 
     def __init__(self, out_channels=3, dim=32, num_blocks=(4, 4, 4, 4),
                  num_refinement_blocks=4, heads=(1, 2, 4, 8), se_reduction=8,
-                 expert_blocks=2, film_hidden=16):
+                 expert_blocks=2, film_hidden=16, upsample=True):
         super().__init__()
         del num_refinement_blocks   # lives inside the head
         self.dim = dim
         self.num_experts = 1        # contract compatibility with MoEDenoiser
+        # See MoEDenoiser: False makes this a denoise-only RAW->RAW model.
+        self.upsample = bool(upsample)
 
         # ======== Shared trunk (identical topology to MoEDenoiser) ========
         self.bayer_unshuffle = nn.PixelUnshuffle(2)
@@ -621,7 +644,8 @@ class FiLMDenoiser(nn.Module):
 
         # ======== FiLM conditioning + single head ========
         self.film = FiLMGenerator(dim * 2, in_channels=5, hidden=film_hidden)
-        self.head = ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction)
+        self.head = ExpertHead(dim * 2, out_channels, expert_blocks, se_reduction,
+                               upsample=self.upsample)
 
     def _trunk(self, x):
         x_level1 = self.patch_embed(self.bayer_unshuffle(x))
@@ -715,12 +739,24 @@ def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16,
           per-pixel FiLM transform instead of routed)
     kwargs are forwarded to the underlying model(s):
         out_channels, dim, num_blocks, num_refinement_blocks, heads,
-        se_reduction (None for legacy pre-SE checkpoints).
+        se_reduction (None for legacy pre-SE checkpoints), upsample.
     num_experts is accepted for every mode (the training script always
     passes it) but only "moe" uses it; the rest ignore it, same as they
     already ignore expert_blocks/gate_hidden.
+
+    upsample=False builds the denoise-only RAW->RAW variant: output is
+    (out_channels, H, W) at packed Bayer resolution rather than
+    (out_channels, 2H, 2W) at sensor resolution. Pair it with
+    out_channels=4 to predict a denoised packed mosaic. Only "moe" and
+    "film" support it -- "single" and "dual" wrap TransUNet_Teacher_HDR,
+    whose output stride is fixed.
     """
     mode = mode.lower()
+    if not kwargs.get("upsample", True) and mode in ("single", "dual"):
+        raise ValueError(
+            f"mode '{mode}' has no RAW->RAW variant: it wraps "
+            "TransUNet_Teacher_HDR, whose output stride is fixed. Use "
+            "mode='moe' or 'film' with upsample=False.")
     if mode == "moe":
         return MoEDenoiser(num_experts=num_experts, expert_blocks=expert_blocks,
                            gate_hidden=gate_hidden, **kwargs)

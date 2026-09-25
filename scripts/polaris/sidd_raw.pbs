@@ -1,0 +1,79 @@
+#!/bin/bash -l
+#PBS -N hdr_sidd_raw
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# RAW->RAW denoising on SIDD, four model sizes in parallel, one per GPU.
+#
+#   qsub scripts/polaris/sidd_raw.pbs
+#   qsub -v HDR_SIDD_EPOCHS=1 scripts/polaris/sidd_raw.pbs      # smoke
+#
+# This is the comparable-numbers run: SIDD raw validation is scored as mean
+# per-block PSNR on the mosaic, which is a number other papers also report.
+# The noisy input scores 37.19 dB on those 1280 blocks and published raw
+# methods reach the low 50s, so that is the range to read results against.
+#
+# Sizes span the knee the architecture sweep found on the HDR task, to see
+# whether the same capacity/quality shape holds on real noise.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+export WANDB_MODE=offline
+
+TAG="${HDR_SIDD_TAG:-v1}"
+DIMS=(8 16 24 32)
+PIDS=()
+
+for i in "${!DIMS[@]}"; do
+    D="${DIMS[$i]}"
+    LOG="logs/${PBS_JOBID:-interactive}_sidd_D${D}.log"
+    hdr::log "dim=${D} on GPU ${i}  (log: ${LOG})"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_DIM="$D"
+        export HDR_MODE=moe
+        export HDR_NUM_EXPERTS=2
+        export HDR_SAVE_FOLDER="models_sidd_raw_D${D}_${TAG}/"
+        export OMP_NUM_THREADS=8
+        export HDR_DATALOADER_WORKERS="${HDR_SIDD_WORKERS:-6}"
+        "$HDR_PYTHON" train_sidd_raw.py
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!DIMS[@]}"; do
+    if wait "${PIDS[$i]}"; then
+        hdr::log "dim=${DIMS[$i]}: OK"
+    else
+        hdr::log "dim=${DIMS[$i]}: FAILED (exit $?)"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "best val PSNR per run:"
+for D in "${DIMS[@]}"; do
+    f="logs/${PBS_JOBID:-interactive}_sidd_D${D}.log"
+    [[ -f "$f" ]] && hdr::log "  dim=${D}: $(grep -oE 'best val PSNR [0-9.]+' "$f" | tail -1)"
+done
+hdr::log "finished: $(date)  status=$status"
+hdr::head
+exit $status
