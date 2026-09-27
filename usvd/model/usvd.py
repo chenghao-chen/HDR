@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from .noise_estimator import NoiseEstimator
 from .prox_denoiser import ProxDenoiser
@@ -70,8 +71,8 @@ class USVD(nn.Module):
             residual = weight * (x - y)
             x_grad = x - alpha[k] * residual
             if self.checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    self.denoisers[k], x_grad, sigma_map, use_reentrant=False)
+                x = _checkpoint(self.denoisers[k], x_grad, sigma_map,
+                                use_reentrant=False)
             else:
                 x = self.denoisers[k](x_grad, sigma_map)
         return x, sigma_map

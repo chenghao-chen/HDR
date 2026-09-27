@@ -376,18 +376,42 @@ if __name__ == "__main__":
     best_psnr_mu = 0.0
     last_epoch_psnr_mu, last_epoch_loss = 0.0, 1e6
 
-    model_kwargs = {
-        "dim":                  TRUNK_DIM,
-        "num_blocks":           NUM_BLOCKS,
-        "num_refinement_blocks": 4,
-        "heads":                [1, 2, 4, 8],
-        "se_reduction":         8,
-        # In model_kwargs, not alongside it, for the same round-trip reason as
-        # film_hidden below: build_denoiser takes expert_blocks as a named
-        # parameter for every mode, so the checkpoint rebuilds the exact head
-        # depth instead of silently falling back to the default of 2.
-        "expert_blocks":        EXPERT_BLOCKS,
-    }
+    if MODE == "usvd":
+        # USVD is a flat unrolled model with no trunk, so the trunk
+        # hyperparameters below do not describe it. A clean dict keeps the
+        # checkpoint's model_kwargs an honest record of the architecture.
+        # out_channels=3 / upsample=True select the joint denoise+demosaic
+        # output: sensor-resolution RGB, matching every other mode here.
+        model_kwargs = {
+            "in_channels":   4,
+            "out_channels":  3,
+            "upsample":      True,
+            "num_iters":     int(os.environ.get("HDR_USVD_ITERS", "8")),
+            "d_model":       int(os.environ.get("HDR_USVD_DMODEL", "256")),
+            "share_weights": os.environ.get("HDR_USVD_SHARE", "0") == "1",
+            "patch_size":    int(os.environ.get("HDR_USVD_PATCH", "8")),
+            "top_k":         int(os.environ.get("HDR_USVD_TOPK", "16")),
+            # The similarity matrix is O(N^2) in patch count and is held for
+            # the backward pass at every unrolled step. At this phase's 512
+            # packed patches that is N=4096, so the default chunk is smaller
+            # here than the module's own default.
+            "chunk_size":    int(os.environ.get("HDR_USVD_CHUNK", "512")),
+            "checkpoint":    os.environ.get("HDR_USVD_CKPT", "1") == "1",
+        }
+    else:
+        model_kwargs = {
+            "dim":                  TRUNK_DIM,
+            "num_blocks":           NUM_BLOCKS,
+            "num_refinement_blocks": 4,
+            "heads":                [1, 2, 4, 8],
+            "se_reduction":         8,
+            # In model_kwargs, not alongside it, for the same round-trip
+            # reason as film_hidden below: build_denoiser takes
+            # expert_blocks as a named parameter for every mode, so the
+            # checkpoint rebuilds the exact head depth instead of silently
+            # falling back to the default of 2.
+            "expert_blocks":        EXPERT_BLOCKS,
+        }
     if MODE == "film":
         # Stored in model_kwargs (not passed alongside it) so it round-trips
         # through the checkpoint: load_model_from_checkpoint rebuilds the

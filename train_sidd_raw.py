@@ -23,7 +23,9 @@ Environment (same pattern as the HDR trainer):
     HDR_SIDD_ROOT       dataset root holding SIDD_Medium_Raw/ and the
                         Validation*.mat blocks
     HDR_SAVE_FOLDER     run directory; resumes from latest.pth inside it
-    HDR_MODE            moe | film            (single/dual have no raw variant)
+    HDR_MODE            moe | film | usvd     (single/dual have no raw variant)
+    HDR_USVD_ITERS, HDR_USVD_DMODEL, HDR_USVD_SHARE, HDR_USVD_PATCH,
+    HDR_USVD_TOPK, HDR_USVD_CHUNK, HDR_USVD_CKPT   (usvd only)
     HDR_NUM_EXPERTS, HDR_DIM, HDR_NUM_BLOCKS, HDR_EXPERT_BLOCKS, HDR_FILM_HIDDEN
     HDR_SIDD_EPOCHS, HDR_SIDD_BATCH, HDR_SIDD_CROP, HDR_DATALOADER_WORKERS
 """
@@ -95,18 +97,35 @@ def main():
 
     # out_channels=4 / upsample=False are what make this RAW->RAW; both live
     # in model_kwargs so the checkpoint rebuilds the same architecture.
-    model_kwargs = {
-        "out_channels": 4,
-        "upsample": False,
-        "dim": DIM,
-        "num_blocks": NUM_BLOCKS,
-        "num_refinement_blocks": 4,
-        "heads": [1, 2, 4, 8],
-        "se_reduction": 8,
-        "expert_blocks": EXPERT_BLOCKS,
-    }
-    if MODE == "film":
-        model_kwargs["film_hidden"] = FILM_HIDDEN
+    if MODE == "usvd":
+        # USVD has no trunk, so the trunk hyperparameters above do not apply.
+        # Building a clean dict rather than passing them to be discarded keeps
+        # the checkpoint's model_kwargs an honest record of the architecture.
+        model_kwargs = {
+            "out_channels": 4,
+            "upsample": False,
+            "in_channels": 4,
+            "num_iters": int(os.environ.get("HDR_USVD_ITERS", "8")),
+            "d_model": int(os.environ.get("HDR_USVD_DMODEL", "256")),
+            "share_weights": os.environ.get("HDR_USVD_SHARE", "0") == "1",
+            "patch_size": int(os.environ.get("HDR_USVD_PATCH", "8")),
+            "top_k": int(os.environ.get("HDR_USVD_TOPK", "16")),
+            "chunk_size": int(os.environ.get("HDR_USVD_CHUNK", "1024")),
+            "checkpoint": os.environ.get("HDR_USVD_CKPT", "0") == "1",
+        }
+    else:
+        model_kwargs = {
+            "out_channels": 4,
+            "upsample": False,
+            "dim": DIM,
+            "num_blocks": NUM_BLOCKS,
+            "num_refinement_blocks": 4,
+            "heads": [1, 2, 4, 8],
+            "se_reduction": 8,
+            "expert_blocks": EXPERT_BLOCKS,
+        }
+        if MODE == "film":
+            model_kwargs["film_hidden"] = FILM_HIDDEN
 
     model = build_denoiser(MODE, num_experts=NUM_EXPERTS, **model_kwargs).to(device)
     n_params = sum(p.numel() for p in model.parameters())

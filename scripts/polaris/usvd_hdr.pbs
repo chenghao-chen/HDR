@@ -1,0 +1,96 @@
+#!/bin/bash -l
+#PBS -N hdr_usvd_hdr
+#PBS -A lighthouse-purdue
+#PBS -q preemptable
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=08:00:00
+#PBS -r y
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# USVD on the Mobile-HDR joint denoise+demosaic task, four configurations in
+# parallel, one per GPU.
+#
+#   qsub scripts/polaris/usvd_hdr.pbs
+#   qsub -v HDR_NUM_EPOCHS=1 scripts/polaris/usvd_hdr.pbs      # smoke
+#
+# Same ladder as usvd_sidd.pbs so the two benchmarks are directly
+# comparable, and overlapping the MoE arch sweep's 95k-1.3M rungs so the two
+# families can be read against each other at matched budgets.
+#
+# Queue note: this does NOT fit the debug queue. USVD measures ~400 s/epoch
+# on this task against 72 s/epoch for a 20.7M MoE -- 5.6x slower with 37x
+# fewer parameters, because the non-local similarity is O(N^2) and phase 1's
+# 512 packed patches give N=4096. At 50 epochs that is ~5.6 hours, so this
+# runs on preemptable with -r y. The trainer resumes from latest.pth inside
+# the pinned HDR_SAVE_FOLDER, which is exactly the pattern RUNNING.md
+# describes for preemption.
+#
+# Memory is a risk too. Phase 1 trains on 512 packed patches,
+# so the non-local similarity sees N=4096 patches and its O(N^2) matrix is
+# held for the backward pass at every unrolled step. The trainer defaults to
+# chunk_size=512 and gradient checkpointing for this mode; both are
+# overridable via HDR_USVD_CHUNK / HDR_USVD_CKPT.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+export WANDB_MODE=offline
+
+TAG="${HDR_USVD_TAG:-v1}"
+CONFIGS=("shared_K8   8     256    1"
+         "K4_d128     4     128    0"
+         "K8_d256     8     256    0"
+         "K8_d512     8     512    0")
+PIDS=()
+
+for i in "${!CONFIGS[@]}"; do
+    read -r LABEL ITERS DMODEL SHARE <<< "${CONFIGS[$i]}"
+    LOG="logs/${PBS_JOBID:-interactive}_usvd_hdr_${LABEL}.log"
+    hdr::log "${LABEL}: iters=${ITERS} d_model=${DMODEL} share=${SHARE} on GPU ${i}"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_MODE=usvd
+        export HDR_USVD_ITERS="$ITERS"
+        export HDR_USVD_DMODEL="$DMODEL"
+        export HDR_USVD_SHARE="$SHARE"
+        export HDR_SAVE_FOLDER="models_usvd_hdr_${LABEL}_${TAG}/"
+        export OMP_NUM_THREADS=8
+        export HDR_DATALOADER_WORKERS="${HDR_USVD_WORKERS:-4}"
+        "$HDR_PYTHON" train_A100_MoE_two_phase.py
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!CONFIGS[@]}"; do
+    read -r LABEL _ <<< "${CONFIGS[$i]}"
+    if wait "${PIDS[$i]}"; then
+        hdr::log "${LABEL}: OK"
+    else
+        hdr::log "${LABEL}: FAILED (exit $?)"
+        status=1
+    fi
+done
+
+hdr::head
+for c in "${CONFIGS[@]}"; do
+    read -r LABEL _ <<< "$c"
+    f="logs/${PBS_JOBID:-interactive}_usvd_hdr_${LABEL}.log"
+    [[ -f "$f" ]] && hdr::log "  ${LABEL}: $(grep -oE 'best PSNR-µ = [0-9.]+' "$f" | tail -1)"
+done
+hdr::log "finished: $(date)  status=$status"
+hdr::head
+exit $status

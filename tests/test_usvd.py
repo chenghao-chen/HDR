@@ -151,3 +151,25 @@ def test_eval_mode_clamps_to_unit_range():
     assert float(out.max()) <= 1.0
     assert float(experts.max()) <= 1.0
     assert float(out.min()) > 0.0
+
+
+def test_gradient_checkpointing_matches_and_still_trains():
+    """checkpoint=True is a memory knob: same values, same trainable params.
+
+    It is off by default, so without this the path would only ever run in a
+    job -- which is where it first failed, on a missing import.
+    """
+    torch.manual_seed(0)
+    plain = build_denoiser("usvd", **_kwargs(num_iters=2)).train()
+    ckpt = build_denoiser("usvd", **_kwargs(num_iters=2, checkpoint=True)).train()
+    ckpt.load_state_dict(plain.state_dict())
+
+    x, snr = _inputs(1, 32, 32, seed=7)
+    a, _, _ = plain(x, snr)
+    b, _, _ = ckpt(x, snr)
+    assert torch.allclose(a, b, atol=1e-6)
+
+    b.square().mean().backward()
+    dead = [n for n, p in ckpt.named_parameters()
+            if p.requires_grad and (p.grad is None or float(p.grad.norm()) == 0.0)]
+    assert not dead, f"no gradient under checkpointing: {dead}"

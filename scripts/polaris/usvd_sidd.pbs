@@ -1,0 +1,88 @@
+#!/bin/bash -l
+#PBS -N hdr_usvd_sidd
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# USVD on SIDD (RAW->RAW), four configurations in parallel, one per GPU.
+#
+#   qsub scripts/polaris/usvd_sidd.pbs
+#   qsub -v HDR_SIDD_EPOCHS=1 scripts/polaris/usvd_sidd.pbs    # smoke
+#
+# USVD has no feature width: it works in image space on the 4 packed Bayer
+# channels, so hidden_mult barely moves the parameter count and the design
+# tops out near 1.6M with the knobs the spec exposes. The ladder therefore
+# varies the two that do matter -- unrolled steps and the non-local
+# embedding width -- plus weight sharing at the bottom.
+#
+# Spans 0.086M to 1.08M, which overlaps the MoE ladder's 95k-1.3M rungs, so
+# the two families can be read against each other at matched budgets.
+# Reference points: noisy input 37.19 dB; MoE at 1.33M reached 42.65 dB.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+export WANDB_MODE=offline
+
+TAG="${HDR_USVD_TAG:-v1}"
+#        label        iters dmodel share
+CONFIGS=("shared_K8   8     256    1"
+         "K4_d128     4     128    0"
+         "K8_d256     8     256    0"
+         "K8_d512     8     512    0")
+PIDS=()
+
+for i in "${!CONFIGS[@]}"; do
+    read -r LABEL ITERS DMODEL SHARE <<< "${CONFIGS[$i]}"
+    LOG="logs/${PBS_JOBID:-interactive}_usvd_sidd_${LABEL}.log"
+    hdr::log "${LABEL}: iters=${ITERS} d_model=${DMODEL} share=${SHARE} on GPU ${i}"
+    (
+        export CUDA_VISIBLE_DEVICES="$i"
+        export HDR_MODE=usvd
+        export HDR_USVD_ITERS="$ITERS"
+        export HDR_USVD_DMODEL="$DMODEL"
+        export HDR_USVD_SHARE="$SHARE"
+        export HDR_SAVE_FOLDER="models_usvd_sidd_${LABEL}_${TAG}/"
+        export OMP_NUM_THREADS=8
+        export HDR_DATALOADER_WORKERS="${HDR_SIDD_WORKERS:-6}"
+        "$HDR_PYTHON" train_sidd_raw.py
+    ) > "$LOG" 2>&1 &
+    PIDS+=($!)
+done
+
+hdr::log "waiting on: ${PIDS[*]}"
+hdr::rule
+
+status=0
+for i in "${!CONFIGS[@]}"; do
+    read -r LABEL _ <<< "${CONFIGS[$i]}"
+    if wait "${PIDS[$i]}"; then
+        hdr::log "${LABEL}: OK"
+    else
+        hdr::log "${LABEL}: FAILED (exit $?)"
+        status=1
+    fi
+done
+
+hdr::head
+hdr::log "best val PSNR per config:"
+for c in "${CONFIGS[@]}"; do
+    read -r LABEL _ <<< "$c"
+    f="logs/${PBS_JOBID:-interactive}_usvd_sidd_${LABEL}.log"
+    [[ -f "$f" ]] && hdr::log "  ${LABEL}: $(grep -oE 'best val PSNR [0-9.]+' "$f" | tail -1)"
+done
+hdr::log "finished: $(date)  status=$status"
+hdr::head
+exit $status
