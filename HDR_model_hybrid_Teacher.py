@@ -737,6 +737,8 @@ def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16,
     mode: "moe" (shared trunk + K light experts)  |  "dual"  |  "single"
         | "film" (shared trunk + one head, continuously modulated by a
           per-pixel FiLM transform instead of routed)
+        | "usvd" (flat unrolled proximal-gradient denoiser, no trunk; see
+          usvd/adapter.py for how it meets this signature)
     kwargs are forwarded to the underlying model(s):
         out_channels, dim, num_blocks, num_refinement_blocks, heads,
         se_reduction (None for legacy pre-SE checkpoints), upsample.
@@ -767,5 +769,13 @@ def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16,
     if mode == "film":
         return FiLMDenoiser(expert_blocks=expert_blocks, film_hidden=film_hidden,
                             **kwargs)
+    if mode == "usvd":
+        # Imported here, not at module scope: USVD needs einops, and every
+        # trainer and evaluation script imports this module. A missing
+        # optional dependency should break the one mode that needs it, not
+        # the whole project.
+        from usvd.adapter import USVDDenoiser
+        return USVDDenoiser(**kwargs)
     raise ValueError(
-        f"Unknown denoiser mode '{mode}' (use moe | dual | single | film)")
+        f"Unknown denoiser mode '{mode}' "
+        "(use moe | dual | single | film | usvd)")
