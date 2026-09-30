@@ -1,0 +1,17 @@
+run,label,lr,iters,dmodel,share,folder
+shared_K8_lr5em05,shared_K8,5e-05,8,256,1,models_usvdlr_shared_K8_lr5em05
+shared_K8_lr0p0001,shared_K8,0.0001,8,256,1,models_usvdlr_shared_K8_lr0p0001
+shared_K8_lr0p0002,shared_K8,0.0002,8,256,1,models_usvdlr_shared_K8_lr0p0002
+shared_K8_lr0p0004,shared_K8,0.0004,8,256,1,models_usvdlr_shared_K8_lr0p0004
+K4_d128_lr5em05,K4_d128,5e-05,4,128,0,models_usvdlr_K4_d128_lr5em05
+K4_d128_lr0p0001,K4_d128,0.0001,4,128,0,models_usvdlr_K4_d128_lr0p0001
+K4_d128_lr0p0002,K4_d128,0.0002,4,128,0,models_usvdlr_K4_d128_lr0p0002
+K4_d128_lr0p0004,K4_d128,0.0004,4,128,0,models_usvdlr_K4_d128_lr0p0004
+K8_d256_lr5em05,K8_d256,5e-05,8,256,0,models_usvdlr_K8_d256_lr5em05
+K8_d256_lr0p0001,K8_d256,0.0001,8,256,0,models_usvdlr_K8_d256_lr0p0001
+K8_d256_lr0p0002,K8_d256,0.0002,8,256,0,models_usvdlr_K8_d256_lr0p0002
+K8_d256_lr0p0004,K8_d256,0.0004,8,256,0,models_usvdlr_K8_d256_lr0p0004
+K8_d512_lr5em05,K8_d512,5e-05,8,512,0,models_usvdlr_K8_d512_lr5em05
+K8_d512_lr0p0001,K8_d512,0.0001,8,512,0,models_usvdlr_K8_d512_lr0p0001
+K8_d512_lr0p0002,K8_d512,0.0002,8,512,0,models_usvdlr_K8_d512_lr0p0002
+K8_d512_lr0p0004,K8_d512,0.0004,8,512,0,models_usvdlr_K8_d512_lr0p0004

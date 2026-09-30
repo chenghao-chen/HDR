@@ -27,7 +27,8 @@ Environment (same pattern as the HDR trainer):
     HDR_USVD_ITERS, HDR_USVD_DMODEL, HDR_USVD_SHARE, HDR_USVD_PATCH,
     HDR_USVD_TOPK, HDR_USVD_CHUNK, HDR_USVD_CKPT   (usvd only)
     HDR_NUM_EXPERTS, HDR_DIM, HDR_NUM_BLOCKS, HDR_EXPERT_BLOCKS, HDR_FILM_HIDDEN
-    HDR_SIDD_EPOCHS, HDR_SIDD_BATCH, HDR_SIDD_CROP, HDR_DATALOADER_WORKERS
+    HDR_SIDD_EPOCHS, HDR_SIDD_BATCH, HDR_SIDD_CROP, HDR_SIDD_LR,
+    HDR_DATALOADER_WORKERS
 """
 from __future__ import annotations
 
@@ -90,7 +91,8 @@ def main():
     batch_sz = int(os.environ.get("HDR_SIDD_BATCH", "16"))
     crop = int(os.environ.get("HDR_SIDD_CROP", "256"))
     workers = int(os.environ.get("HDR_DATALOADER_WORKERS", "8"))
-    lr, eta_min, warmup = 2e-4, 1e-6, 3
+    lr = float(os.environ.get("HDR_SIDD_LR", "2e-4"))
+    eta_min, warmup = 1e-6, 3
     grad_clip = 1.0
     balance_weight = 0.001 if MODE == "moe" else 0.0
     aux_weight = 0.5 if MODE == "moe" else 0.0

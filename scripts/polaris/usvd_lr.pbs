@@ -1,0 +1,74 @@
+#!/bin/bash -l
+#PBS -N hdr_usvd_lr
+#PBS -A lighthouse-purdue
+#PBS -q debug-scaling
+#PBS -l select=4:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Learning-rate sweep for USVD on SIDD: 4 configurations x 4 rates, 16 runs,
+# one per GPU across 4 nodes.
+#
+#   python -c "..." > usvd_lr_manifest.csv     # see the commit that added it
+#   qsub scripts/polaris/usvd_lr.pbs
+#
+# Why: the first USVD SIDD sweep scaled backwards. At a single rate of 2e-4,
+# 0.155M scored 44.72 dB while 1.079M scored 42.72 -- monotonically worse
+# with more capacity, which is not a capacity story. K=8 unrolled steps is a
+# much deeper effective network than K=4, so the suspicion is that one rate
+# cannot serve both ends of the ladder. This sweep tests that directly
+# rather than reporting the anomaly as a property of the design.
+#
+# 16 runs at ~12 s/epoch x 60 epochs is ~12 minutes of compute; 4 nodes run
+# them all at once rather than in four sequential waves, which would not fit
+# the 59-minute cap with margin.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+MANIFEST="${HDR_SWEEP_MANIFEST:-usvd_lr_manifest.csv}"
+STATUS_DIR="logs/usvdlr_status_${PBS_JOBID:-interactive}"
+WORKER="scripts/polaris/usvd_lr_worker.sh"
+
+[[ -f "$MANIFEST" ]] || hdr::die "manifest not found: $MANIFEST"
+
+NRUNS=$(( $(wc -l < "$MANIFEST") - 1 ))
+NNODES=$(wc -l < "${PBS_NODEFILE:-/dev/null}" 2>/dev/null || echo 0)
+CAPACITY=$(( NNODES * 4 ))
+hdr::log "manifest: $MANIFEST ($NRUNS runs), nodes=$NNODES capacity=$CAPACITY"
+(( NRUNS > CAPACITY )) && hdr::die "need $NRUNS GPUs, have $CAPACITY"
+
+mkdir -p "$STATUS_DIR" logs
+chmod +x "$WORKER"
+export HDR_SWEEP_MANIFEST="$MANIFEST"
+export HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+
+hdr::rule
+mpiexec -n "$NRUNS" --ppn 4 --depth=8 --cpu-bind depth "./$WORKER"
+rc=$?
+
+hdr::head
+hdr::log "mpiexec returned: $rc"
+ok=0; bad=0
+while IFS=',' read -r run _rest; do
+    [[ "$run" == "run" ]] && continue
+    s="$STATUS_DIR/${run}.status"; st="NO STATUS"
+    [[ -f "$s" ]] && st="$(< "$s")"
+    f="logs/${PBS_JOBID:-interactive}_usvdlr_${run}.log"
+    best="$(grep -oE 'best val PSNR [0-9.]+' "$f" 2>/dev/null | tail -1)"
+    hdr::log "  ${run}: ${st} ${best}"
+    [[ "$st" == "OK" ]] && ok=$((ok+1)) || bad=$((bad+1))
+done < "$MANIFEST"
+hdr::log "ok=$ok bad=$bad of $NRUNS"
+hdr::head
+(( bad == 0 )) && exit 0
+exit 1
