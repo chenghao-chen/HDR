@@ -321,7 +321,8 @@ if __name__ == "__main__":
         PATCH_SIZE     = 512
         batch_sz       = 8
         num_patch      = 8    # 8 virtual repeats per image per epoch
-        lr             = 1e-4  # higher LR safe with batch 8
+        lr             = float(os.environ.get("HDR_LR", "1e-4"))
+                               # higher LR safe with batch 8
         warmup_epochs  = 10    # linear ramp from 1% lr prevents early instability
         num_epochs     = 50
         eta_min        = 1e-6  # cosine decays from lr=1e-4 down to 1e-6

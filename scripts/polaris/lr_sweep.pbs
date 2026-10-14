@@ -1,0 +1,74 @@
+#!/bin/bash -l
+#PBS -N hdr_lr_sweep
+#PBS -A lighthouse-purdue
+#PBS -l select=5:system=polaris
+#PBS -l place=scatter
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Learning-rate sweep across both model families and one benchmark.
+#
+#   qsub -q debug-scaling -l walltime=00:59:00 \
+#        -v HDR_SWEEP_MANIFEST=lr_sidd_manifest.csv scripts/polaris/lr_sweep.pbs
+#   qsub -q preemptable -l walltime=08:00:00 -r y \
+#        -v HDR_SWEEP_MANIFEST=lr_hdr_manifest.csv scripts/polaris/lr_sweep.pbs
+#
+# Queue and walltime are passed at submit rather than fixed here, because the
+# two benchmarks differ by an order of magnitude in cost: SIDD trains on
+# 128x128 packed crops and finishes in minutes, while the HDR task trains on
+# 512 packed patches where USVD's O(N^2) non-local attention costs ~400 s per
+# epoch, putting a 50-epoch run near six hours.
+#
+# 20 runs = 4 configurations x 5 rates, one per GPU across 5 nodes.
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+MANIFEST="${HDR_SWEEP_MANIFEST:?set HDR_SWEEP_MANIFEST}"
+STATUS_DIR="logs/lrsweep_status_${PBS_JOBID:-interactive}"
+WORKER="scripts/polaris/lr_sweep_worker.sh"
+
+[[ -f "$MANIFEST" ]] || hdr::die "manifest not found: $MANIFEST"
+
+NRUNS=$(( $(wc -l < "$MANIFEST") - 1 ))
+NNODES=$(wc -l < "${PBS_NODEFILE:-/dev/null}" 2>/dev/null || echo 0)
+CAPACITY=$(( NNODES * 4 ))
+hdr::log "manifest: $MANIFEST ($NRUNS runs)  nodes=$NNODES capacity=$CAPACITY"
+(( NRUNS > CAPACITY )) && hdr::die "need $NRUNS GPUs, have $CAPACITY"
+
+mkdir -p "$STATUS_DIR" logs
+chmod +x "$WORKER"
+export HDR_SWEEP_MANIFEST="$MANIFEST"
+export HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+
+hdr::rule
+mpiexec -n "$NRUNS" --ppn 4 --depth=8 --cpu-bind depth "./$WORKER"
+rc=$?
+
+hdr::head
+hdr::log "mpiexec returned: $rc"
+ok=0; bad=0
+while IFS=',' read -r run bench _rest; do
+    [[ "$run" == "run" ]] && continue
+    s="$STATUS_DIR/${run}.status"; st="NO STATUS"
+    [[ -f "$s" ]] && st="$(< "$s")"
+    f="logs/${PBS_JOBID:-interactive}_lrsweep_${bench}_${run}.log"
+    if [[ "$bench" == "sidd" ]]; then
+        best="$(grep -oE 'best val PSNR [0-9.]+' "$f" 2>/dev/null | tail -1)"
+    else
+        best="$(grep -oE 'best PSNR-µ = [0-9.]+' "$f" 2>/dev/null | tail -1)"
+    fi
+    hdr::log "  ${run}: ${st}  ${best}"
+    [[ "$st" == "OK" ]] && ok=$((ok+1)) || bad=$((bad+1))
+done < "$MANIFEST"
+hdr::log "ok=$ok bad=$bad of $NRUNS"
+hdr::head
+(( bad == 0 )) && exit 0
+exit 1
