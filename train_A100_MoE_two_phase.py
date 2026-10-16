@@ -251,7 +251,9 @@ if __name__ == "__main__":
     # ── Reproducibility ───────────────────────────────────────────────
     # seed_all covers the host RNG plus whichever device RNG is in play;
     # torch.cuda.manual_seed_all is a silent no-op on an Intel GPU.
-    seed = 21
+    # HDR_SEED makes repeats differ, so run-to-run noise can be measured;
+    # 21 stays the default so every earlier run remains reproducible.
+    seed = int(os.environ.get("HDR_SEED", "21"))
     ACC.seed_all(seed)
     random.seed(seed)
 
@@ -359,6 +361,7 @@ if __name__ == "__main__":
 
     # Shared loss weights
     mu             = 5000   # µ-law tonemapping constant (HDR literature standard)
+    lin_weight     = float(os.environ.get("HDR_LIN_WEIGHT", "0"))  # linear-domain L1
     aux_weight     = 0.5  if MODE in ("moe", "dual") else 0.0
     # Anti expert-collapse, but weak: at 0.01 this term dominated the gate's
     # training signal and pinned routing near-uniform (measured on the first
@@ -377,7 +380,13 @@ if __name__ == "__main__":
     best_psnr_mu = 0.0
     last_epoch_psnr_mu, last_epoch_loss = 0.0, 1e6
 
-    if MODE == "usvd":
+    if MODE == "baseline":
+        # A learned reference from hdr_baselines; its own constructor
+        # defaults define its size unless HDR_BASELINE_KW overrides them.
+        import json as _json
+        model_kwargs = {"name": os.environ["HDR_BASELINE"], "use_snr": True,
+                        **_json.loads(os.environ.get("HDR_BASELINE_KW", "{}"))}
+    elif MODE == "usvd":
         # USVD is a flat unrolled model with no trunk, so the trunk
         # hyperparameters below do not describe it. A clean dict keeps the
         # checkpoint's model_kwargs an honest record of the architecture.
@@ -718,6 +727,15 @@ if __name__ == "__main__":
                             + gamma          * loss_perceptual
                             + aux_weight     * loss_aux
                             + balance_weight * loss_balance)
+                if lin_weight > 0.0:
+                    # mu-law L1 alone barely penalises highlight errors, and
+                    # linear PSNR is dominated by highlights: the trained
+                    # model scored BELOW the un-denoised input on linear
+                    # PSNR (34.6 vs 35.7 dB) while winning every tonemapped
+                    # metric. A linear-domain term restores that pressure.
+                    loss_lin = (((y_pred.float() - y_rgb.float()).abs()
+                                 * valid_mask).sum() / (valid_px * C + 1e-6))
+                    ttl_loss = ttl_loss + lin_weight * loss_lin
 
                 # ── Backward (bf16 autocast → no GradScaler needed) ──
                 ttl_loss.backward()

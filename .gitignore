@@ -26,3 +26,6 @@ report/
 
 # Core dumps
 core.*
+
+# Per-job manifest splits and submitted job IDs (regenerable operational state)
+manifests/

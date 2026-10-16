@@ -1,0 +1,85 @@
+#!/bin/bash -l
+#PBS -N hdr_sidd_prep
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:59:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Prep + rehearsal for the SIDD calibration/benchmark sweep, on one node:
+#
+#   1. build the uncompressed packed SIDD-Medium cache (idempotent)
+#   2. verify cached planes are bit-identical to the released .MAT files
+#   3. measure params / GFLOPs-per-MP / latency for every candidate (GPU 0)
+#   4. 2-epoch smoke of each family on the cached+augmented path (GPUs 1-3),
+#      which also measures real seconds-per-step for sizing the long runs
+# ============================================================================
+
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+export TMPDIR="${HDR_SWEEP_TMPDIR:-/tmp}"
+
+SIDD=/lus/eagle/projects/lighthouse-purdue/ryanchen/datasets/SIDD
+CACHE=$SIDD/cache_packed_f32
+
+hdr::rule; hdr::log "1. cache build"
+OMP_NUM_THREADS=1 "$HDR_PYTHON" scripts/cache_sidd_raw.py --root "$SIDD" --out "$CACHE" --workers 24 \
+    || hdr::die "cache build failed"
+du -sh "$CACHE"
+
+hdr::rule; hdr::log "2. cache fidelity"
+"$HDR_PYTHON" - <<PY || hdr::die "cache fidelity check failed"
+import glob, os, numpy as np, h5py, torch
+from hdr_data.sidd import SIDDMediumRaw, _cache_path
+from hdr_data.bayer import pack
+ds = SIDDMediumRaw("$SIDD", crop_size=2, num_patch=1)
+picks = [ds.pairs[0][0], ds.pairs[0][1], ds.pairs[len(ds.pairs)//2][1], ds.pairs[-1][0]]
+for src in picks:
+    with h5py.File(src, "r") as fh:
+        p = torch.from_numpy(fh["x"][()]).float().t().contiguous()
+    h, w = p.shape
+    ref = pack(p[:h-h%2, :w-w%2].unsqueeze(0)).numpy()
+    got = np.load(_cache_path("$CACHE", src), mmap_mode="r")
+    assert ref.shape == got.shape, (src, ref.shape, got.shape)
+    assert np.array_equal(ref, np.asarray(got)), src
+    print("identical:", os.path.basename(src), got.shape)
+PY
+
+hdr::rule; hdr::log "3. efficiency (GPU 0)   +   4. smoke (GPUs 1-3), in parallel"
+( export CUDA_VISIBLE_DEVICES=0
+  "$HDR_PYTHON" scripts/measure_efficiency.py --out efficiency_sidd.csv
+) > logs/${PBS_JOBID}_efficiency.log 2>&1 &
+P0=$!
+
+smoke() {  # gpu mode extra-env...
+    local gpu=$1 name=$2; shift 2
+    ( export CUDA_VISIBLE_DEVICES=$gpu HDR_SAVE_FOLDER="models_sidd_smoke_${name}/" \
+             HDR_SIDD_CACHE="$CACHE" HDR_SIDD_AUG=1 HDR_SEED=7 HDR_SIDD_EPOCHS=2 \
+             HDR_DATALOADER_WORKERS=6 WANDB_MODE=offline OMP_NUM_THREADS=8 "$@"
+      rm -rf "models_sidd_smoke_${name}"
+      "$HDR_PYTHON" train_sidd_raw.py
+    ) > logs/${PBS_JOBID}_smoke_${name}.log 2>&1
+    echo "smoke $name: exit $?"
+}
+smoke 1 unet  HDR_MODE=unet_n2n HDR_SIDD_LR=3e-4 &
+P1=$!
+smoke 2 moed8 HDR_MODE=moe HDR_DIM=8 HDR_SIDD_LR=8e-4 &
+P2=$!
+smoke 3 usvdk4 HDR_MODE=usvd HDR_USVD_ITERS=4 HDR_USVD_DMODEL=128 HDR_USVD_SHARE=0 HDR_SIDD_LR=1.6e-3 &
+P3=$!
+wait $P0; echo "efficiency: exit $?"
+wait $P1 $P2 $P3
+
+hdr::rule; hdr::log "results"
+cat efficiency_sidd.csv 2>/dev/null
+for n in unet moed8 usvdk4; do
+    echo "--- $n"; grep -E "params=|seed=|\[epoch|FINAL|Error|error" logs/${PBS_JOBID}_smoke_${n}.log | tail -6
+done
+hdr::head

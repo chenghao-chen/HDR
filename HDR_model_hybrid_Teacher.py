@@ -776,6 +776,25 @@ def build_denoiser(mode, num_experts=3, expert_blocks=2, gate_hidden=16,
         # the whole project.
         from usvd.adapter import USVDDenoiser
         return USVDDenoiser(**kwargs)
+    if mode == "baseline":
+        # The standard learned JDD references (DemosaicNet, U-Net, DnCNN,
+        # Restormer-lite) from hdr_baselines, trained with this project's
+        # recipe so the comparison is architecture-for-architecture. The
+        # registry name lives in model_kwargs so checkpoints round-trip.
+        from hdr_baselines.registry import LEARNED
+        kw = dict(kwargs)
+        name = kw.pop("name")
+        kw.pop("upsample", None)
+        return LEARNED[name](**kw)
+    if mode == "unet_n2n":
+        # Calibration reference only (see hdr_baselines/n2n_unet.py): the
+        # published supervised raw-SIDD U-Net, so this project's SIDD
+        # numbers can be checked against the literature on equal footing.
+        from hdr_baselines.n2n_unet import N2NUNet
+        return N2NUNet(in_channels=kwargs.get("in_channels", 4),
+                       out_channels=kwargs.get("out_channels", 4),
+                       width=kwargs.get("width", 48),
+                       residual=kwargs.get("residual", False))
     raise ValueError(
         f"Unknown denoiser mode '{mode}' "
-        "(use moe | dual | single | film | usvd)")
+        "(use moe | dual | single | film | usvd | unet_n2n | baseline)")

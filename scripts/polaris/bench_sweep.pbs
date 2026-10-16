@@ -1,0 +1,54 @@
+#!/bin/bash -l
+#PBS -N hdr_bench
+#PBS -A lighthouse-purdue
+#PBS -l place=scatter
+#PBS -l filesystems=home:eagle
+#PBS -r y
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# Generic benchmark sweep: one run per GPU, configuration entirely in the
+# manifest (see bench_worker.sh). Queue, node count and walltime are given
+# at submit time because sweeps differ by orders of magnitude in cost:
+#
+#   qsub -q prod -l select=10:system=polaris -l walltime=03:00:00 \
+#        -v HDR_SWEEP_MANIFEST=bench_sidd.csv scripts/polaris/bench_sweep.pbs
+#
+# Rerunnable (-r y): both trainers resume from <folder>/latest.pth, so a
+# preempted or walltime-killed sweep continues where it stopped when
+# resubmitted with the same manifest.
+# ============================================================================
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+MANIFEST="${HDR_SWEEP_MANIFEST:?set HDR_SWEEP_MANIFEST}"
+STATUS_DIR="logs/bench_status_${PBS_JOBID:-interactive}"
+WORKER="${HDR_SWEEP_WORKER:-scripts/polaris/bench_worker.sh}"
+[[ -f "$MANIFEST" ]] || hdr::die "manifest not found: $MANIFEST"
+
+NRUNS=$(( $(wc -l < "$MANIFEST") - 1 ))
+NNODES=$(wc -l < "${PBS_NODEFILE:-/dev/null}" 2>/dev/null || echo 0)
+CAP=$(( NNODES * 4 ))
+hdr::log "manifest: $MANIFEST ($NRUNS runs)  nodes=$NNODES capacity=$CAP"
+(( NRUNS > CAP )) && hdr::die "need $NRUNS GPUs, have $CAP"
+(( NRUNS < CAP )) && hdr::warn "$(( CAP - NRUNS )) GPU(s) idle"
+
+mkdir -p "$STATUS_DIR" logs
+export HDR_SWEEP_MANIFEST="$MANIFEST" HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+mpiexec -n "$NRUNS" --ppn 4 --depth=8 --cpu-bind depth "./$WORKER"
+hdr::log "mpiexec returned: $?"
+
+ok=0; bad=0
+while IFS=',' read -r run bench folder _e; do
+    [[ "$run" == "run" ]] && continue
+    st="NO STATUS"; [[ -f "$STATUS_DIR/$run.status" ]] && st="$(< "$STATUS_DIR/$run.status")"
+    res=""; [[ -f "$folder/result.json" ]] && res="$(tr -d '\n ' < "$folder/result.json" | grep -oE '"final_val_psnr":[0-9.]+')"
+    hdr::log "  $run: $st $res"
+    [[ "$st" == "OK" ]] && ok=$((ok+1)) || bad=$((bad+1))
+done < "$MANIFEST"
+hdr::log "ok=$ok bad=$bad of $NRUNS"
+(( bad == 0 )) && exit 0; exit 1

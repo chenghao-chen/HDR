@@ -44,7 +44,8 @@ from torch.utils.data import Dataset
 
 from .bayer import pack
 
-__all__ = ["SIDDValidationRaw", "SIDDMediumRaw", "SIDD_CAMERA_PATTERNS"]
+__all__ = ["SIDDValidationRaw", "SIDDMediumRaw", "SIDD_CAMERA_PATTERNS",
+           "build_cache"]
 
 
 def _load_mat(path: str, key_hint: str):
@@ -178,7 +179,8 @@ class SIDDMediumRaw(Dataset):
 
     def __init__(self, root: str, crop_size: int = 256, num_patch: int = 8,
                  transform=None, return_meta: bool = False,
-                 scenes: Optional[list] = None):
+                 scenes: Optional[list] = None,
+                 cache_dir: Optional[str] = None):
         data_dir = os.path.join(root, "SIDD_Medium_Raw", "Data")
         if not os.path.isdir(data_dir):
             raise FileNotFoundError(
@@ -212,6 +214,24 @@ class SIDDMediumRaw(Dataset):
         self.num_sources = len(self.pairs)
         self._shapes: Dict[str, Any] = {}
 
+        # The released planes are gzip-compressed HDF5 in 5-row chunks, so a
+        # 256x256 crop decompresses ~50 chunks across two files on Lustre for
+        # every sample -- enough to make training loader-bound at every model
+        # size. With a cache built by build_cache(), crops are slices of
+        # uncompressed packed memmaps, which the page cache shares between
+        # the ranks on a node.
+        self.cache_dir = cache_dir
+        self._mmaps: Dict[str, Any] = {}
+        if cache_dir is not None:
+            missing = [g for g, n, _ in self.pairs
+                       if not (os.path.isfile(_cache_path(cache_dir, g))
+                               and os.path.isfile(_cache_path(cache_dir, n)))]
+            if missing:
+                raise FileNotFoundError(
+                    f"{len(missing)} of {len(self.pairs)} pairs missing from "
+                    f"cache {cache_dir}; run scripts/cache_sidd_raw.py first "
+                    f"(first missing: {missing[0]})")
+
     def __len__(self) -> int:
         return len(self.pairs) * self.num_patch
 
@@ -232,8 +252,39 @@ class SIDDMediumRaw(Dataset):
             block = fh["x"][left:left + size, top:top + size]
         return torch.from_numpy(block).float().t().contiguous()
 
+    def _mmap(self, path: str):
+        import numpy as np
+        if path not in self._mmaps:
+            self._mmaps[path] = np.load(_cache_path(self.cache_dir, path),
+                                        mmap_mode="r")
+        return self._mmaps[path]
+
+    def _cached_pair(self, gt_path: str, noisy_path: str):
+        gt, nz = self._mmap(gt_path), self._mmap(noisy_path)
+        _, hp, wp = gt.shape
+        cs = min(self.crop_size // 2, hp, wp)
+        # Packed coordinates: every offset is a whole 2x2 cell, so the CFA
+        # phase is preserved by construction.
+        top = int(torch.randint(0, hp - cs + 1, (1,)).item())
+        left = int(torch.randint(0, wp - cs + 1, (1,)).item())
+        y = torch.from_numpy(gt[:, top:top + cs, left:left + cs].copy())
+        x = torch.from_numpy(nz[:, top:top + cs, left:left + cs].copy())
+        return x, y
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         gt_path, noisy_path, pattern = self.pairs[idx % len(self.pairs)]
+        if self.cache_dir is not None:
+            x, y = self._cached_pair(gt_path, noisy_path)
+            if self.transform is not None:
+                x, y = self.transform(x, y)
+            sample: Dict[str, Any] = {"x": x, "xm": x, "y": y}
+            if self.return_meta:
+                sample["index"] = idx % len(self.pairs)
+                sample["source_id"] = os.path.basename(os.path.dirname(gt_path))
+                sample["pattern"] = pattern
+                sample["noise_meta"] = {"real": True}
+            return sample
+
         h, w = self._plane_shape(gt_path)
         cs = min(self.crop_size, h, w)
         cs -= cs % 2
@@ -261,3 +312,51 @@ class SIDDMediumRaw(Dataset):
     def __repr__(self) -> str:
         return (f"SIDDMediumRaw(pairs={len(self.pairs)}, "
                 f"crop={self.crop_size}, num_patch={self.num_patch})")
+
+
+def _cache_path(cache_dir: str, plane_path: str) -> str:
+    """<cache>/<scene>/<file stem>.npy for a released .MAT plane."""
+    scene = os.path.basename(os.path.dirname(plane_path))
+    stem = os.path.splitext(os.path.basename(plane_path))[0]
+    return os.path.join(cache_dir, scene, stem + ".npy")
+
+
+def _cache_one(args) -> str:
+    import numpy as np
+    import h5py
+    src, dst = args
+    if os.path.isfile(dst):
+        return dst
+    with h5py.File(src, "r") as fh:
+        plane = torch.from_numpy(fh["x"][()]).float().t().contiguous()
+    h, w = plane.shape
+    plane = plane[: h - h % 2, : w - w % 2]
+    packed = pack(plane.unsqueeze(0)).numpy().astype("float32")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = dst + ".tmp.npy"
+    np.save(tmp, packed)
+    # Rename into place last, so an interrupted build never leaves a
+    # truncated file that a later run would trust.
+    os.replace(tmp, dst)
+    return dst
+
+
+def build_cache(root: str, cache_dir: str, workers: int = 8) -> int:
+    """
+    Decompress every SIDD-Medium raw plane once into an uncompressed packed
+    float32 .npy, so training reads crops as memmap slices. Values are kept
+    exactly as released (float32, black-level subtracted, [0, 1]) -- no
+    requantisation -- so results on the cache match results on the .MATs.
+    Idempotent: existing files are skipped.
+    """
+    from multiprocessing import Pool
+    ds = SIDDMediumRaw(root, crop_size=2, num_patch=1)
+    jobs = []
+    for gt, noisy, _ in ds.pairs:
+        for src in (gt, noisy):
+            jobs.append((src, _cache_path(cache_dir, src)))
+    with Pool(max(1, workers)) as pool:
+        for i, _ in enumerate(pool.imap_unordered(_cache_one, jobs), 1):
+            if i % 40 == 0 or i == len(jobs):
+                print(f"  cached {i}/{len(jobs)}", flush=True)
+    return len(jobs)

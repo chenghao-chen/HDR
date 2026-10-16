@@ -1,0 +1,18 @@
+#!/bin/bash -l
+#PBS -N hdr_measure_eff
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:eagle
+#PBS -o logs/
+#PBS -e logs/
+# Params / GFLOPs-per-MP / A100 latency for every SIDD candidate.
+#   qsub scripts/polaris/measure_eff.pbs
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+export CUDA_VISIBLE_DEVICES=0
+"$HDR_PYTHON" scripts/measure_efficiency.py --out efficiency_sidd.csv

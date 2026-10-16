@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader
 
 from HDR_model_hybrid_Teacher import build_denoiser, estimate_local_snr_map
 from hdr_data.sidd import SIDDMediumRaw, SIDDValidationRaw
+from hdr_data import D4Transform
 
 
 def psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
@@ -68,7 +69,15 @@ def evaluate(model, val_loader, device) -> float:
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(1234)
+    # A fixed seed made every repeat of a configuration bit-identical, so
+    # the project never had a run-to-run noise floor to compare differences
+    # against. 1234 stays the default so old runs remain reproducible.
+    seed = int(os.environ.get("HDR_SEED", "1234"))
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     root = os.environ.get(
         "HDR_SIDD_ROOT",
@@ -92,6 +101,12 @@ def main():
     crop = int(os.environ.get("HDR_SIDD_CROP", "256"))
     workers = int(os.environ.get("HDR_DATALOADER_WORKERS", "8"))
     lr = float(os.environ.get("HDR_SIDD_LR", "2e-4"))
+    num_patch = int(os.environ.get("HDR_SIDD_NUM_PATCH", "8"))
+    cache_dir = os.environ.get("HDR_SIDD_CACHE") or None
+    # CFA-preserving D4 (whole 2x2 cells move, phase unchanged). Off by
+    # default so the earlier runs stay reproducible; standard practice for
+    # supervised raw SIDD training is to augment.
+    augment = os.environ.get("HDR_SIDD_AUG", "0") == "1"
     eta_min, warmup = 1e-6, 3
     grad_clip = 1.0
     balance_weight = 0.001 if MODE == "moe" else 0.0
@@ -99,7 +114,11 @@ def main():
 
     # out_channels=4 / upsample=False are what make this RAW->RAW; both live
     # in model_kwargs so the checkpoint rebuilds the same architecture.
-    if MODE == "usvd":
+    if MODE == "unet_n2n":
+        model_kwargs = {"in_channels": 4, "out_channels": 4, "upsample": False,
+                        "width": int(os.environ.get("HDR_UNET_WIDTH", "48")),
+                        "residual": os.environ.get("HDR_UNET_RESIDUAL", "0") == "1"}
+    elif MODE == "usvd":
         # USVD has no trunk, so the trunk hyperparameters above do not apply.
         # Building a clean dict rather than passing them to be discarded keeps
         # the checkpoint's model_kwargs an honest record of the architecture.
@@ -133,7 +152,11 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"mode={MODE} K={NUM_EXPERTS} dim={DIM} params={n_params/1e6:.3f}M")
 
-    train_ds = SIDDMediumRaw(root, crop_size=crop, num_patch=8)
+    transform = D4Transform(mode="cell", allow_transpose=True) if augment else None
+    train_ds = SIDDMediumRaw(root, crop_size=crop, num_patch=num_patch,
+                             transform=transform, cache_dir=cache_dir)
+    print(f"seed={seed} augment={augment} cache={cache_dir} lr={lr} "
+          f"epochs={epochs} batch={batch_sz} crop={crop} num_patch={num_patch}")
     val_ds = SIDDValidationRaw(root)
     print(f"train: {train_ds}\nval:   {val_ds}")
 
@@ -219,7 +242,19 @@ def main():
             torch.save(ckpt, save_folder + "sidd_best.pth")
             print(f"  new best: {best:.3f} dB", flush=True)
 
-    print(f"\nfinished. best val PSNR {best:.3f} dB -> {save_folder}sidd_best.pth")
+    # Report the FINAL model, not the best-on-val one: selecting the epoch on
+    # the validation blocks and then scoring on the same blocks is biased
+    # upward, and the bias grows with the number of configurations compared.
+    final = evaluate(model, val_loader, device)
+    import json
+    with open(save_folder + "result.json", "w") as fh:
+        json.dump({"final_val_psnr": final, "best_val_psnr": best,
+                   "params": n_params, "mode": MODE, "seed": seed, "lr": lr,
+                   "epochs": epochs, "steps_per_epoch": steps,
+                   "total_steps": steps * epochs, "augment": augment,
+                   "model_kwargs": model_kwargs}, fh, indent=1)
+    print(f"\nfinished. FINAL val PSNR {final:.3f} dB "
+          f"(best-on-val {best:.3f}, biased) -> {save_folder}latest.pth")
 
 
 if __name__ == "__main__":
