@@ -29,3 +29,5 @@ core.*
 
 # Per-job manifest splits and submitted job IDs (regenerable operational state)
 manifests/
+# Live run claims held by running benchmark jobs (see scripts/polaris/claim_lib.sh)
+claims/

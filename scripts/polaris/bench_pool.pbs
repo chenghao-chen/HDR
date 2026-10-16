@@ -1,0 +1,49 @@
+#!/bin/bash -l
+#PBS -N hdr_bench_pool
+#PBS -A lighthouse-purdue
+#PBS -q capacity
+#PBS -l select=4:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=24:00:00
+#PBS -l filesystems=home:eagle
+#PBS -r y
+#PBS -o logs/
+#PBS -e logs/
+
+# ============================================================================
+# A worker pool: a fixed number of GPUs works through a manifest of any
+# length, each rank claiming and training one run after another
+# (scripts/polaris/bench_worker.sh + claim_lib.sh).
+#
+#   qsub -v HDR_SWEEP_MANIFEST=bench_pool.csv scripts/polaris/bench_pool.pbs
+#
+# Built for the `capacity` queue: 1-4 nodes, up to 168 h, one running job per
+# project. That shape suits a long backlog of short single-GPU runs far
+# better than one job per run. Runs already DONE are skipped and runs held by
+# a live job elsewhere are left alone, so this can be queued alongside
+# per-part jobs for the same rows without risking a double run.
+# ============================================================================
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$(pwd)}" || exit 1
+source "${PBS_O_WORKDIR:-$(pwd)}/scripts/lib/hdr_env.sh"
+hdr::init
+hdr::banner
+
+MANIFEST="${HDR_SWEEP_MANIFEST:?set HDR_SWEEP_MANIFEST}"
+[[ -f "$MANIFEST" ]] || hdr::die "manifest not found: $MANIFEST"
+NNODES=$(wc -l < "${PBS_NODEFILE:-/dev/null}" 2>/dev/null || echo 0)
+NRANKS=$(( NNODES * 4 ))
+STATUS_DIR="logs/bench_status_${PBS_JOBID:-interactive}"
+mkdir -p "$STATUS_DIR" logs
+export HDR_SWEEP_MANIFEST="$MANIFEST" HDR_SWEEP_STATUS_DIR="$STATUS_DIR"
+
+hdr::log "pool: $NRANKS GPUs over $(( $(wc -l < "$MANIFEST") - 1 )) runs in $MANIFEST"
+mpiexec -n "$NRANKS" --ppn 4 --depth=8 --cpu-bind depth ./scripts/polaris/bench_worker.sh
+hdr::log "mpiexec returned: $?"
+
+done_n=0; left=""
+while IFS=',' read -r run bench folder _e; do
+    [[ "$run" == "run" ]] && continue
+    if [[ -f "$folder/DONE" ]]; then done_n=$((done_n+1)); else left+=" $run"; fi
+done < "$MANIFEST"
+hdr::log "DONE: $done_n   not done:${left:- none}"
